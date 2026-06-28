@@ -1,0 +1,18 @@
+protocol: cmd.v1
+
+open_event:
+  addr: 127.0.0.1:9527
+  max_payload_bytes: 16777216
+
+principal: 30001
+token: token-xxx
+
+channel_ids:
+  - 2001
+
+output_dir: cmd-worker-output
+max_concurrent_tasks: 8
+default_timeout_ms: 300000
+fetch_idle_sleep_ms: 100
+fetch_error_max_retries: 3
+fetch_error_retry_sleep_ms: 1000
