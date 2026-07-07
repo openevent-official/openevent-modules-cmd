@@ -29,6 +29,7 @@ OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
 
 @dataclass(frozen=True)
 class CmdRunRequestInput:
+    request_id: str
     command: str
     workdir: str | None = None
     timeout_ms: int | None = None
@@ -37,6 +38,7 @@ class CmdRunRequestInput:
 
 @dataclass(frozen=True)
 class CmdRunRequest:
+    request_id: str
     command: str
     ts_ms: int
     workdir: str | None = None
@@ -122,6 +124,7 @@ class CmdKillResult:
 
 @dataclass(frozen=True)
 class CmdOutputReadRequestInput:
+    request_id: str
     target_seq: int
     stream: str
     offset: int
@@ -131,6 +134,7 @@ class CmdOutputReadRequestInput:
 
 @dataclass(frozen=True)
 class CmdOutputReadRequest:
+    request_id: str
     target_seq: int
     stream: str
     offset: int

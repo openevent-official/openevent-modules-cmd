@@ -1,14 +1,18 @@
-# 配置
+# Configuration
 
-本文定义 `cmd-worker` YAML 配置结构。worker 通过启动参数读取配置：
+[中文版](CONFIGURATION_cn.md)
+
+This document defines the `cmd-worker` YAML configuration structure. The worker
+loads the configuration through its startup argument:
 
 ```bash
 cmd-worker --config cmd-worker.yaml
 ```
 
-仓库提供了可复制的示例文件：[../examples/cmd-worker.yaml](../examples/cmd-worker.yaml)。
+The repository includes a copyable example:
+[../examples/cmd-worker.yaml](../examples/cmd-worker.yaml).
 
-## 示例
+## Example
 
 ```yaml
 protocol: cmd.v1
@@ -32,48 +36,54 @@ fetch_error_max_retries: 3
 fetch_error_retry_sleep_ms: 1000
 ```
 
-只处理一个 channel 时，也使用单元素列表：
+Use a single-item list when the worker handles one channel:
 
 ```yaml
 channel_ids:
   - 2001
 ```
 
-## 字段
+## Fields
 
-| 字段 | 必填 | 默认值 | 说明 |
+| Field | Required | Default | Description |
 | --- | --- | --- | --- |
-| `protocol` | 是 | 无 | 必须为 `cmd.v1` |
-| `open_event.addr` | 是 | 无 | OpenEvent 服务地址 |
-| `open_event.max_payload_bytes` | 否 | `16777216` | OpenEvent 部署的消息 payload 大小上限，必须是正整数；用于控制 worker 写出的 result payload 不超过部署上限 |
-| `principal` | 是 | 无 | cmd-worker 使用的 OpenEvent principal，必须是正整数 |
-| `token` | 是 | 无 | cmd-worker 使用的 OpenEvent token，必须是非空字符串 |
-| `channel_ids` | 是 | 无 | cmd-worker 处理的 channel id 列表，必须是非空数组；每个元素必须是正整数，不能包含 `0`，不能重复 |
-| `output_dir` | 否 | `cmd-worker-output` | worker 本地输出根目录；stdout/stderr 文件会持续写入该目录，清理和容量保护由部署方负责 |
-| `max_concurrent_tasks` | 否 | `8` | 同时运行的命令任务上限，必须是正整数 |
-| `default_timeout_ms` | 否 | `300000` | 默认命令超时，必须是正整数；请求缺失 `timeout_ms` 时使用 worker 处理该请求时的当前配置 |
-| `fetch_idle_sleep_ms` | 否 | `100` | 主线程调度循环空闲时的 sleep 时间，必须是正整数 |
-| `fetch_error_max_retries` | 否 | `3` | worker 任意 `Fetch` 调用首次失败后的最大重试次数，必须是正整数 |
-| `fetch_error_retry_sleep_ms` | 否 | `1000` | worker 任意 `Fetch` 调用失败后每次重试前的 sleep 时间，必须是正整数 |
+| `protocol` | yes | none | Must be `cmd.v1`. |
+| `open_event.addr` | yes | none | OpenEvent server address. |
+| `open_event.max_payload_bytes` | no | `16777216` | OpenEvent deployment payload size limit. Must be a positive integer. The worker uses it to keep result payloads under the deployment limit. |
+| `principal` | yes | none | OpenEvent principal used by cmd-worker. Must be a positive integer. |
+| `token` | yes | none | OpenEvent token used by cmd-worker. Must be a non-empty string. |
+| `channel_ids` | yes | none | Channel ids handled by cmd-worker. Must be a non-empty array of positive integers; `0` and duplicates are not allowed. |
+| `output_dir` | no | `cmd-worker-output` | Local output root. stdout/stderr files are written under this directory; cleanup and capacity protection are deployment responsibilities. |
+| `max_concurrent_tasks` | no | `8` | Maximum number of concurrently running command tasks. Must be a positive integer. |
+| `default_timeout_ms` | no | `300000` | Default command timeout. Must be a positive integer. Used when a request omits `timeout_ms`, based on the worker configuration active when the request is handled. |
+| `fetch_idle_sleep_ms` | no | `100` | Sleep time used by the main scheduling loop when idle. Must be a positive integer. |
+| `fetch_error_max_retries` | no | `3` | Maximum retry count after any worker `Fetch` call first fails. Must be a positive integer. |
+| `fetch_error_retry_sleep_ms` | no | `1000` | Sleep time before each retry after a worker `Fetch` call fails. Must be a positive integer. |
 
-未知配置字段视为配置错误。
+Unknown configuration fields are configuration errors.
 
-## Channel 要求
+## Channel Requirements
 
-`channel_ids` 中列出的每个 channel 必须满足 `cmd.v1` 协议文档中的 channel 规则：
+Every channel listed in `channel_ids` must satisfy the channel rules from the
+`cmd.v1` protocol document:
 
-- channel protocol 为 `cmd.v1`。
-- channel visibility 不能是 public。
-- cmd-worker principal 必须是 channel 成员。
-- 业务调用方 principal 必须是 channel 成员。
-- channel description 必须符合 `cmd.v1` 协议文档。
+- The channel protocol is `cmd.v1`.
+- The channel visibility is not public.
+- The cmd-worker principal is a channel member.
+- Business caller principals are channel members.
+- The channel description follows the `cmd.v1` protocol document.
 
-worker 只处理 `channel_ids` 中列出的 channel。未列出的 channel 即使 protocol 是 `cmd.v1`，也不属于该
-worker 的处理范围。
+The worker only processes channels listed in `channel_ids`. A channel not listed
+there is outside this worker's scope even if its protocol is `cmd.v1`.
 
-## 运行注意事项
+## Runtime Notes
 
-- `output_dir` 可以是相对路径或绝对路径；相对路径按启动 `cmd-worker` 时的当前工作目录解析。
-- worker 启动时会创建并写入 `output_dir`，如果目录无法创建或不可写，会报配置/环境错误并退出。
-- 每个 channel 的输出会写入 `output_dir/<channel_id>/`，不同 channel 的输出文件不会混用。
-- 当前实现不自动清理输出文件，也不限制单个命令的 stdout/stderr 文件大小。
+- `output_dir` may be relative or absolute. Relative paths are resolved against
+  the current working directory used to start `cmd-worker`.
+- The worker creates and writes to `output_dir` during startup. If the directory
+  cannot be created or written, startup fails with a configuration/environment
+  error.
+- Each channel writes output under `output_dir/<channel_id>/`. Output files from
+  different channels are never mixed.
+- The current implementation does not automatically clean output files and does
+  not limit stdout/stderr file size for individual commands.

@@ -1,17 +1,20 @@
-# Cmd 协议 cmd.v1
+# Cmd Protocol cmd.v1
 
-> 状态：v0.1 初始发布  
-> 范围：OpenEvent 通道 `protocol="cmd.v1"` 的 Linux 命令任务 payload 与通道 description。
+[中文版](CMD_PROTOCOL_cn.md)
 
-## 1. 通道
+> Status: v0.1 initial release
+> Scope: Linux command task payloads and channel descriptions for OpenEvent
+> channels with `protocol="cmd.v1"`.
 
-所有 cmd channel 必须设置：
+## 1. Channel
+
+Every cmd channel must use:
 
 ```text
 protocol = "cmd.v1"
 ```
 
-`description` 必须是 JSON 字符串：
+`description` must be a JSON string:
 
 ```json
 {
@@ -21,45 +24,55 @@ protocol = "cmd.v1"
 }
 ```
 
-字段规则：
+Field rules:
 
-- `version`：字符串，当前固定为 `v1`。
-- `updated_at_ms`：整数，Unix 毫秒时间戳。
-- `metadata`：可选对象，用于部署或业务域静态元数据。
+- `version`: string, currently fixed to `v1`.
+- `updated_at_ms`: integer Unix timestamp in milliseconds.
+- `metadata`: optional object for static deployment or business-domain
+  metadata.
 
-cmd 通道不能使用 public visibility。业务调用方和 cmd worker principal 必须都是
-通道成员。多 worker 冲突不由 `cmd.v1` 协议处理；部署方必须保证同一个通道同一时刻只有一个
-有效 cmd worker 进程消费。
+Cmd channels must not use public visibility. Business caller principals and the
+cmd-worker principal must all be channel members. `cmd.v1` does not resolve
+conflicts from multiple workers. Deployments must ensure there is only one
+effective cmd-worker process consuming the same channel at a time.
 
-## 2. 公共规则
+## 2. Common Rules
 
-所有 `cmd.v1` payload 都是 UTF-8 JSON 对象。未知字段视为非法。
+All `cmd.v1` payloads are UTF-8 JSON objects. Unknown fields are invalid.
 
-本文把 OpenEvent 部署的消息 payload 大小上限记为 `max_payload_bytes`。该上限由 OpenEvent
-部署决定；参考实现默认值为 16 MiB。cmd 协议中和消息大小相关的限制都按实际部署值计算。
+This document uses `max_payload_bytes` for the OpenEvent deployment message
+payload size limit. That limit is deployment-specific; the reference
+implementation default is 16 MiB. All cmd protocol limits related to message
+size are computed against the actual deployment value.
 
-公共字段：
+Common fields:
 
-- `kind`：必填，取值为 `cmd.run.request`、`cmd.run.result`、
-  `cmd.run.accepted`、`cmd.kill.request`、`cmd.kill.result`、
-  `cmd.output.read.request` 或 `cmd.output.read.result`。
-- `ts_ms`：必填，payload 生成方写入的 Unix 毫秒时间戳。
+- `kind`: required. One of `cmd.run.request`, `cmd.run.result`,
+  `cmd.run.accepted`, `cmd.kill.request`, `cmd.kill.result`,
+  `cmd.output.read.request`, or `cmd.output.read.result`.
+- `ts_ms`: required. Unix timestamp in milliseconds written by the payload
+  producer.
 
-OpenEvent 顶层 `principal`、`channel_id`、`seq`、`ts_ms` 和 `recipients` 承载身份、服务端写入时间
-与路由信息，不在 payload 内重复存储。
-OpenEvent 顶层 `EventMessage.ts_ms` 是服务端收到该消息写入请求时生成的 Unix 毫秒时间戳。
-cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的 OpenEvent 顶层
-`EventMessage.ts_ms`，不能使用 payload 内的 `ts_ms`。
+OpenEvent top-level `principal`, `channel_id`, `seq`, `ts_ms`, and `recipients`
+carry identity, server write time, and routing information. They are not
+duplicated inside payloads. OpenEvent top-level `EventMessage.ts_ms` is the Unix
+millisecond timestamp generated when the server receives the message publish
+request. When the cmd protocol computes command timeouts, it must use the
+OpenEvent top-level `EventMessage.ts_ms` of the corresponding
+`cmd.run.request`, not the payload `ts_ms`.
 
-非法 payload 但能识别出对应请求类型时，worker 必须写对应 result，并通过
-`status="REJECTED"` 表示拒绝；如果 payload 损坏到无法识别请求类型，worker 只能记录错误并忽略。
-所有 `status="REJECTED"` 的 result 都必须写 `error_message`，用于说明拒绝原因。
+When a payload is invalid but the request kind can be identified, the worker
+must write the corresponding result with `status="REJECTED"`. If the payload is
+too damaged to identify the request kind, the worker can only log the error and
+ignore it. Every result with `status="REJECTED"` must include `error_message` to
+explain the rejection.
 
 ## 3. `cmd.run.request`
 
 ```json
 {
   "kind": "cmd.run.request",
+  "request_id": "cmd:agent:s1:wal:100:0",
   "ts_ms": 1710000000000,
   "command": "echo hello",
   "workdir": "/absolute/path/to/workdir",
@@ -67,29 +80,42 @@ cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是业务调用方 principal。
-- OpenEvent `recipients` 必须为空。
-- `command` 必填，是非空字符串，表示要执行的完整 Linux 命令行。
-- worker 使用 Linux shell 执行 `command`；默认等价于 `/bin/sh -c <command>`。
-- `workdir` 可选，是非空字符串，表示命令执行工作目录；缺失时使用 worker 当前工作目录。
-- `workdir` 如果出现，必须是绝对路径。
-- `workdir` 是绝对路径但不存在、不是目录、无权限进入，或导致 shell 进程无法启动时，payload 本身不视为非法；
-  worker 写 `cmd.run.result(status=START_FAILED)` 和 `error_message`。
-- `timeout_ms` 可选，必须是正整数；缺失时 worker 使用配置里的默认超时。
-- `timeout_ms` 缺失时始终使用 worker 处理该请求时的当前默认超时配置；启动恢复处理历史未 accepted
-  run request 时也是如此。
-- 超时截止时间按该 `cmd.run.request` 消息的 OpenEvent 顶层 `EventMessage.ts_ms` 加 `timeout_ms` 计算；
-  缺失 `timeout_ms` 时使用配置里的默认超时。payload 内的 `ts_ms` 不作为超时起点。
-- `cmd.run.request` 不支持独立的 `env` 或 `stdin` 字段。
-- 该 OpenEvent 消息的 `seq` 是命令任务 ID。
+- OpenEvent `principal` is the business caller principal.
+- OpenEvent `recipients` must be empty.
+- `request_id` is required. It is a caller-generated idempotency identifier and
+  may contain only letters, digits, dots, underscores, colons, and hyphens.
+- `command` is required. It must be a non-empty string containing the full Linux
+  command line to execute.
+- The worker executes `command` through the Linux shell; by default this is
+  equivalent to `/bin/sh -c <command>`.
+- `workdir` is optional. It is a non-empty string describing the command working
+  directory. If absent, the worker uses its current working directory.
+- When present, `workdir` must be an absolute path.
+- If `workdir` is absolute but does not exist, is not a directory, cannot be
+  entered due to permissions, or causes the shell process to fail to start, the
+  payload itself is not invalid. The worker writes
+  `cmd.run.result(status=START_FAILED)` with `error_message`.
+- `timeout_ms` is optional and must be a positive integer. If absent, the worker
+  uses the configured default timeout.
+- Missing `timeout_ms` always uses the default timeout configuration active when
+  the worker handles that request. This also applies when startup recovery
+  handles historical run requests that were not accepted.
+- The timeout deadline is computed from the OpenEvent top-level
+  `EventMessage.ts_ms` of this `cmd.run.request` plus `timeout_ms`. If
+  `timeout_ms` is absent, the configured default timeout is used. The payload
+  `ts_ms` is not the timeout start point.
+- `cmd.run.request` does not support separate `env` or `stdin` fields.
+- The OpenEvent `seq` of this message is the command task id.
 
 ## 4. `cmd.run.accepted`
 
-worker 准备启动合法且未超时的 `cmd.run.request` 时，必须在启动命令进程前写入确认消息。
-该消息表示 worker 已经接手并即将启动该 run request，后续要么写最终 `cmd.run.result`，
-要么在启动恢复时被补失败 result。
+When the worker is ready to start a valid, non-expired `cmd.run.request`, it must
+write an accepted message before starting the command process. This message
+means the worker has taken ownership of the run request and is about to start
+it. Later, the worker either writes the final `cmd.run.result`, or startup
+recovery completes it with a failed result.
 
 ```json
 {
@@ -99,23 +125,27 @@ worker 准备启动合法且未超时的 `cmd.run.request` 时，必须在启动
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是 cmd worker principal。
-- OpenEvent `recipients` 是原始 `cmd.run.request` 的发送方 principal。
-- `prev_seq` 必填，必须等于对应 run request 的 OpenEvent seq。
-- `cmd.run.accepted` 必须在启动命令进程前写入。
-- 如果 run request 非法，worker 不写 `cmd.run.accepted`，直接写
-  `cmd.run.result(status=REJECTED)`。
-- 如果 run request 在获得执行槽位前已经超时，worker 不写 `cmd.run.accepted`，直接写
-  `cmd.run.result(status=TIMEOUT)`。
-- 如果 run request 在待执行队列中被 kill 删除，worker 不写 `cmd.run.accepted`，直接写
-  `cmd.run.result(status=KILLED)`。
+- OpenEvent `principal` is the cmd-worker principal.
+- OpenEvent `recipients` is the sender principal of the original
+  `cmd.run.request`.
+- `prev_seq` is required and must equal the OpenEvent seq of the corresponding
+  run request.
+- `cmd.run.accepted` must be written before the command process starts.
+- If the run request is invalid, the worker does not write `cmd.run.accepted`;
+  it writes `cmd.run.result(status=REJECTED)` directly.
+- If the run request expires before obtaining an execution slot, the worker does
+  not write `cmd.run.accepted`; it writes `cmd.run.result(status=TIMEOUT)`
+  directly.
+- If the run request is killed while still pending, the worker does not write
+  `cmd.run.accepted`; it writes `cmd.run.result(status=KILLED)` directly.
 
 ## 5. `cmd.run.result`
 
-stdout/stderr 小于等于 1k 时直接写内容，大于 1k 时只写文件元信息。本文中的 1k 固定按
-1024 字节计算，stdout 和 stderr 分别独立判断。
+stdout/stderr content is inlined when each stream is at most 1k. When a stream
+is larger than 1k, only file metadata is included. In this document, 1k is fixed
+to 1024 bytes and stdout and stderr are evaluated independently.
 
 ```json
 {
@@ -132,36 +162,52 @@ stdout/stderr 小于等于 1k 时直接写内容，大于 1k 时只写文件元�
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是 cmd worker principal。
-- OpenEvent `recipients` 是原始 `cmd.run.request` 的发送方 principal。
-- `prev_seq` 必填，必须等于对应 run request 的 OpenEvent seq。
-- worker 按 OpenEvent 顶层 `channel_id` 建立输出子目录，不同 channel 的输出文件必须分开。
-- `stdout.file` 固定为 `<channel_id>/<prev_seq>.stdout`；`stderr.file` 固定为
-  `<channel_id>/<prev_seq>.stderr`。这里的 `file` 是相对 `output_dir` 的路径。
-- `stdout` 和 `stderr` 分别独立判断输出大小，阈值为 1024 字节：
-  - `bytes <= 1024` 时必须写 `content`，内容为对应输出文件的完整内容。
-  - `bytes > 1024` 时不得写 `content`，只写文件元信息。
-- 实际输出目录由 worker 配置 `output_dir` 决定。
-- `timeout_ms` 是本次运行请求使用的有效超时时间；除 `status="REJECTED"` 且无法确定有效超时外必须出现。
-- `finished_at_ms` 是 worker 写出最终运行结果的时间，所有 `cmd.run.result` 都必须出现。
-- `started_at_ms` 只在命令进程实际启动后出现。
-- `exit_code` 只在 `status="SUCCESS"` 或 `status="FAILED"` 时出现。
-- `error_message` 在 `status="REJECTED"`、`status="START_FAILED"` 或 `status="RECOVERY_FAILED"` 时必须出现。
-- `status="REJECTED"` 时 worker 不启动命令，stdout/stderr 写空输出对象。
-- 启动前已经超时、待执行队列中被 kill、请求非法或启动失败时，stdout/stderr 都写空输出对象。
-- 启动失败包括：channel 输出子目录无法创建、stdout/stderr 文件无法创建或打开、`workdir` 无法进入、
-  shell 进程无法启动。
-- `status="RECOVERY_FAILED"` 时，如果原 stdout/stderr 文件存在，按已有文件写输出对象；如果不存在，写空输出对象。
-- 空输出对象只表示本条 result 中输出为空，不要求对应 stdout/stderr 文件一定存在。
+- OpenEvent `principal` is the cmd-worker principal.
+- OpenEvent `recipients` is the sender principal of the original
+  `cmd.run.request`.
+- `prev_seq` is required and must equal the OpenEvent seq of the corresponding
+  run request.
+- The worker creates output subdirectories by OpenEvent top-level `channel_id`.
+  Output files from different channels must be separated.
+- `stdout.file` is fixed to `<channel_id>/<prev_seq>.stdout`; `stderr.file` is
+  fixed to `<channel_id>/<prev_seq>.stderr`. `file` is relative to `output_dir`.
+- stdout and stderr are evaluated independently with a 1024-byte threshold:
+  - When `bytes <= 1024`, `content` is required and contains the full content of
+    that output file.
+  - When `bytes > 1024`, `content` must be absent and only file metadata is
+    written.
+- The actual output root is configured by worker `output_dir`.
+- `timeout_ms` is the effective timeout used for this run request. It is
+  required except when `status="REJECTED"` and the effective timeout cannot be
+  determined.
+- `finished_at_ms` is the time when the worker writes the final run result. It
+  is required for all `cmd.run.result` messages.
+- `started_at_ms` appears only after the command process actually starts.
+- `exit_code` appears only when `status="SUCCESS"` or `status="FAILED"`.
+- `error_message` is required when `status="REJECTED"`,
+  `status="START_FAILED"`, or `status="RECOVERY_FAILED"`.
+- When `status="REJECTED"`, the worker does not start the command and writes
+  empty output objects for stdout/stderr.
+- When the request expires before startup, is killed while pending, is invalid,
+  or fails to start, stdout/stderr are empty output objects.
+- Startup failure includes failure to create the channel output directory,
+  create or open stdout/stderr files, enter `workdir`, or start the shell
+  process.
+- When `status="RECOVERY_FAILED"`, if original stdout/stderr files exist, the
+  worker writes output objects based on those files; otherwise it writes empty
+  output objects.
+- Empty output objects only mean the output is empty in this result. They do not
+  require the corresponding stdout/stderr file to exist.
 
-### 5.1 stdout/stderr 输出对象
+### 5.1 stdout/stderr Output Object
 
-stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是否出现由该输出流自己的
-`bytes` 决定。出现 `content` 时，必须同时写 `content_encoding`。
+stdout and stderr use the same structure. `file` and `bytes` are required.
+Whether `content` appears is determined by that stream's own `bytes`. When
+`content` appears, `content_encoding` must also appear.
 
-短输出示例，`bytes <= 1024`：
+Short output example, `bytes <= 1024`:
 
 ```json
 {
@@ -172,7 +218,7 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-长输出示例，`bytes > 1024`：
+Long output example, `bytes > 1024`:
 
 ```json
 {
@@ -181,7 +227,7 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-空输出示例：
+Empty output example:
 
 ```json
 {
@@ -192,30 +238,38 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-规则：
+Rules:
 
-- `file` 是相对 `output_dir` 的路径，不包含 `output_dir` 本身。
-- `bytes` 是该输出文件的字节数。
-- `content` 是短输出的完整内容；长输出不得写 `content`。
-- `content_encoding` 只在 `content` 出现时出现，取值为 `utf-8` 或 `base64`。
-- 如果输出字节能按 UTF-8 解码，`content_encoding="utf-8"`，`content` 写解码后的字符串。
-- 如果输出字节不能按 UTF-8 解码，`content_encoding="base64"`，`content` 写原始字节的 base64 字符串。
-- 空输出对象必须写 `bytes=0`、`content_encoding="utf-8"` 和 `content=""`。
-- 空输出对象不表示 `file` 指向的文件一定存在；后续 `cmd.output.read.request` 仍按实际文件是否存在返回结果。
-- stdout 和 stderr 分别独立判断。例如 stdout 为 100 字节、stderr 为 4096 字节时，
-  stdout 必须写 `content`，stderr 只写文件元信息。
+- `file` is a path relative to `output_dir`; it does not include `output_dir`.
+- `bytes` is the byte count of that output file.
+- `content` is the full content for short output. Long output must not include
+  `content`.
+- `content_encoding` appears only when `content` appears. It is either `utf-8`
+  or `base64`.
+- If output bytes can be decoded as UTF-8, `content_encoding="utf-8"` and
+  `content` is the decoded string.
+- If output bytes cannot be decoded as UTF-8, `content_encoding="base64"` and
+  `content` is the base64 string of the raw bytes.
+- Empty output objects must use `bytes=0`, `content_encoding="utf-8"`, and
+  `content=""`.
+- Empty output objects do not imply that the file pointed to by `file` exists.
+  Later `cmd.output.read.request` still returns based on whether the actual file
+  exists.
+- stdout and stderr are evaluated independently. For example, if stdout is 100
+  bytes and stderr is 4096 bytes, stdout must include `content` while stderr
+  only includes file metadata.
 
-`status` 取值：
+`status` values:
 
-| 状态 | 含义 |
+| Status | Meaning |
 | --- | --- |
-| `SUCCESS` | 进程退出码为 0 |
-| `FAILED` | 进程退出码非 0 |
-| `TIMEOUT` | worker 因超时杀掉进程，或在启动前发现请求已经超时 |
-| `KILLED` | worker 因 kill 请求杀掉进程，或从待执行队列中删除未启动任务 |
-| `START_FAILED` | 进程启动前准备失败或进程无法启动，包括输出文件无法创建或打开、工作目录无法进入、shell 无法启动 |
-| `RECOVERY_FAILED` | worker 启动从头消费时发现历史运行请求已有 `cmd.run.accepted` 但没有最终 result，补写失败 result |
-| `REJECTED` | 运行请求 payload 非法或超过协议/配置限制，worker 未执行命令 |
+| `SUCCESS` | Process exit code is 0. |
+| `FAILED` | Process exit code is non-zero. |
+| `TIMEOUT` | Worker killed the process due to timeout, or found before startup that the request had already expired. |
+| `KILLED` | Worker killed the process due to a kill request, or removed a not-yet-started task from the pending queue. |
+| `START_FAILED` | Preparation failed before process startup or the process could not start, including output file create/open failure, working directory enter failure, or shell startup failure. |
+| `RECOVERY_FAILED` | On startup scan, the worker found a historical run request with `cmd.run.accepted` but no final result and completed it with a failed result. |
+| `REJECTED` | Run request payload is invalid or exceeds protocol/configuration limits; the worker did not execute the command. |
 
 ## 6. `cmd.kill.request`
 
@@ -227,14 +281,19 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-规则：
+Rules:
 
-- `target_seq` 必填，必须是正整数，预期指向某条 `cmd.run.request` 的 OpenEvent seq。
-- worker 首版只处理当前 worker 进程内运行中或待执行的任务。
-- 如果目标任务在待执行队列中但尚未启动，worker 直接从待执行队列中删除该任务。
-- 同一 `cmd.v1` channel 内的成员都可以 kill 该 channel 内运行中或待执行的任务，不限制必须由原提交者 kill。
-- kill 请求只作用于请求所在 channel 内的目标任务；`target_seq` 指向其他 channel 的 run request 时，
-  worker 不跨 channel 操作，按 `NOT_FOUND` 返回。
+- `target_seq` is required and must be a positive integer. It is expected to
+  point to the OpenEvent seq of a `cmd.run.request`.
+- The worker handles only tasks running or pending in the current worker
+  process.
+- If the target task is still pending and has not started, the worker removes it
+  from the pending queue directly.
+- Any member of the same `cmd.v1` channel can kill running or pending tasks in
+  that channel. The kill requester does not have to be the original submitter.
+- Kill requests only affect tasks in the channel where the request is published.
+  If `target_seq` points to a run request in another channel, the worker does
+  not operate across channels and returns `NOT_FOUND`.
 
 ## 7. `cmd.kill.result`
 
@@ -248,40 +307,50 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是 cmd worker principal。
-- OpenEvent `recipients` 是原始 `cmd.kill.request` 的发送方 principal。
-- `prev_seq` 必填，必须等于对应 kill request 的 OpenEvent seq。
-- `target_seq` 在能够从原始请求解析出合法值时必须回显；如果原始请求的 `target_seq` 非法或缺失，
-  `status="REJECTED"` 时可以省略。
-- `status="REJECTED"` 时必须写 `error_message`。
+- OpenEvent `principal` is the cmd-worker principal.
+- OpenEvent `recipients` is the sender principal of the original
+  `cmd.kill.request`.
+- `prev_seq` is required and must equal the OpenEvent seq of the corresponding
+  kill request.
+- `target_seq` must be echoed when a valid value can be parsed from the original
+  request. If the original request's `target_seq` is invalid or missing, it may
+  be omitted when `status="REJECTED"`.
+- `error_message` is required when `status="REJECTED"`.
 
-`status` 取值：
+`status` values:
 
-| 状态 | 含义 |
+| Status | Meaning |
 | --- | --- |
-| `KILL_SENT` | 目标任务仍在运行，worker 已发送 kill 信号 |
-| `REMOVED_PENDING` | 目标任务尚未启动，worker 已从待执行队列中删除 |
-| `ALREADY_FINISHED` | 目标任务已经结束，worker 未发送 kill；如果尚未写运行结果，worker 先写最终 run result |
-| `NOT_FOUND` | worker 没有找到目标任务 |
-| `REJECTED` | kill 请求 payload 非法或超过协议/配置限制，worker 未发送 kill |
+| `KILL_SENT` | Target task is still running and the worker sent a kill signal. |
+| `REMOVED_PENDING` | Target task had not started and the worker removed it from the pending queue. |
+| `ALREADY_FINISHED` | Target task had already finished and the worker did not send a kill signal; if its run result had not been written, the worker first writes the final run result. |
+| `NOT_FOUND` | Worker did not find the target task. |
+| `REJECTED` | Kill request payload is invalid or exceeds protocol/configuration limits; the worker did not send a kill signal. |
 
-目标任务仍在运行时，worker 写 `cmd.kill.result(status=KILL_SENT)`，随后目标任务写
-`cmd.run.result(status=KILLED)`。目标任务尚未启动且仍在待执行队列中时，worker 写
-`cmd.kill.result(status=REMOVED_PENDING)`，并为目标运行请求写 `cmd.run.result(status=KILLED)`。
-如果 worker 处理 kill 请求时发现目标进程已经退出但完成事件尚未处理，必须先根据目标进程退出码
-为目标运行请求写 `cmd.run.result(status=SUCCESS)` 或 `cmd.run.result(status=FAILED)`，再写
-`cmd.kill.result(status=ALREADY_FINISHED)`。
+When the target task is still running, the worker writes
+`cmd.kill.result(status=KILL_SENT)`, then the target task writes
+`cmd.run.result(status=KILLED)`. When the target task has not started and is
+still in the pending queue, the worker writes
+`cmd.kill.result(status=REMOVED_PENDING)` and also writes
+`cmd.run.result(status=KILLED)` for the target run request. If the worker handles
+a kill request and finds that the target process has already exited but its
+completion event has not been processed, it must first write
+`cmd.run.result(status=SUCCESS)` or `cmd.run.result(status=FAILED)` according to
+the target process exit code, then write
+`cmd.kill.result(status=ALREADY_FINISHED)`.
 
 ## 8. `cmd.output.read.request`
 
-调用方可以通过消息读取某个命令输出文件的一段内容。该请求只读取 worker 本地
-`output_dir/<channel_id>/` 下的 `<target_seq>.stdout` 或 `<target_seq>.stderr`。
+Callers can read a segment of a command output file through a message. The
+request only reads `<target_seq>.stdout` or `<target_seq>.stderr` under the
+worker-local `output_dir/<channel_id>/`.
 
 ```json
 {
   "kind": "cmd.output.read.request",
+  "request_id": "cmd:agent:s1:wal:100:1",
   "ts_ms": 1710000002000,
   "target_seq": 12345,
   "stream": "stdout",
@@ -290,26 +359,37 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是查询方 principal。
-- OpenEvent `recipients` 必须为空。
-- `target_seq` 必填，必须是目标 `cmd.run.request` 的 OpenEvent seq。
-- `stream` 必填，只能是 `stdout` 或 `stderr`。
-- `offset` 必填，必须是非负整数，表示从输出文件第几个字节开始读。
-- `nbytes` 必填，必须是正整数，表示调用方希望本次最多读取多少字节。
-- worker 返回的 `bytes` 可以小于 `nbytes`。当读取内容按 JSON 和必要的 base64 编码后会导致
-  `cmd.output.read.result` 超过 OpenEvent 部署的 payload 大小上限时，worker 必须减少本次实际读取字节数，
-  确保 result payload 可以写入 OpenEvent。调用方用 `offset + bytes` 继续读取后续内容。
-- `cmd.output.read.request` 不改变目标任务状态，只读取已有输出文件内容。
-- 同一 `cmd.v1` channel 内的成员都可以读取该 channel 内的命令输出。
-- 输出局部读取只作用于请求所在 channel 的输出目录；`target_seq` 指向其他 channel 的 run request 时，
-  worker 不跨 channel 查找，按 `NOT_FOUND` 返回。
-- 字段名使用 `target_seq` 而不是 `seq`，是为了避免和 OpenEvent 顶层消息 `seq` 混淆。
+- OpenEvent `principal` is the querying principal.
+- OpenEvent `recipients` must be empty.
+- `request_id` is required. It is a caller-generated idempotency identifier and
+  may contain only letters, digits, dots, underscores, colons, and hyphens.
+- `target_seq` is required and must be the OpenEvent seq of the target
+  `cmd.run.request`.
+- `stream` is required and must be either `stdout` or `stderr`.
+- `offset` is required and must be a non-negative integer. It is the byte offset
+  in the output file where reading begins.
+- `nbytes` is required and must be a positive integer. It is the maximum number
+  of bytes the caller wants to read in this request.
+- The worker may return `bytes` smaller than `nbytes`. If the read content,
+  after JSON and any required base64 encoding, would make
+  `cmd.output.read.result` exceed the OpenEvent deployment payload limit, the
+  worker must reduce the actual number of bytes read so the result payload can
+  be written to OpenEvent. Callers continue reading with `offset + bytes`.
+- `cmd.output.read.request` does not change the target task state; it only reads
+  existing output file content.
+- Any member of the same `cmd.v1` channel can read command output in that
+  channel.
+- Partial output reads only operate on the output directory for the request
+  channel. If `target_seq` points to a run request in another channel, the
+  worker does not look across channels and returns `NOT_FOUND`.
+- The field is named `target_seq` rather than `seq` to avoid confusion with
+  OpenEvent top-level message `seq`.
 
 ## 9. `cmd.output.read.result`
 
-worker 对局部读取请求写回内容：
+The worker writes content back for a partial read request:
 
 ```json
 {
@@ -328,34 +408,49 @@ worker 对局部读取请求写回内容：
 }
 ```
 
-规则：
+Rules:
 
-- OpenEvent `principal` 是 cmd worker principal。
-- OpenEvent `recipients` 是原始 `cmd.output.read.request` 的发送方 principal。
-- `prev_seq` 必填，必须等于对应 output read request 的 OpenEvent seq。
-- `target_seq`、`stream`、`offset`、`nbytes` 在能够从原始请求解析出合法值时必须回显；如果原始请求中
-  某个字段非法或缺失，`status="REJECTED"` 时可以省略无法回显的字段。
-- `status` 必填，表示本次局部读取请求的处理结果。
-- `bytes` 是实际写入 `content` 的字节数；未读取文件时为 `0`。
-- `content` 必填，写入本次读取到的内容；如果 `offset` 已到达读取开始时的当前文件末尾，则
-  `content` 为空字符串，`bytes=0`，`eof=true`。
-- `content_encoding` 必填，取值为 `utf-8` 或 `base64`。
-- 如果读取到的字节能按 UTF-8 解码，`content_encoding="utf-8"`，`content` 写解码后的字符串。
-- 如果读取到的字节不能按 UTF-8 解码，`content_encoding="base64"`，`content` 写原始字节的 base64 字符串。
-- worker 为保证 result payload 不超过 OpenEvent 部署上限而减少本次读取量时，`bytes` 写实际返回的字节数；
-  只要 `offset + bytes` 尚未到达读取开始时的当前文件大小，`eof` 就必须为 `false`。
-- `eof` 表示本次读取是否已经到达读取开始时的当前文件末尾。worker 打开文件后先取得当时的文件大小；
-  如果 `offset + bytes` 大于或等于该大小，则 `eof=true`。目标任务仍在运行时，`eof=true`
-  不表示该任务之后不会继续写入该输出文件。
-- 如果目标输出文件不存在，worker 写 `status="NOT_FOUND"`、`content=""`、`bytes=0`、
-  `content_encoding="utf-8"`、`eof=true`。
-- 如果目标输出文件存在但 worker 无法 stat、打开或读取，worker 写 `status="READ_FAILED"`、
-  `content=""`、`bytes=0`、`content_encoding="utf-8"`、`eof=false` 和 `error_message`。
-- 如果输出局部读取请求 payload 非法或超过协议/配置限制，worker 写 `status="REJECTED"`、
-  `content=""`、`bytes=0`、`content_encoding="utf-8"`、`eof=true` 和 `error_message`，
-  且不读取输出文件。
+- OpenEvent `principal` is the cmd-worker principal.
+- OpenEvent `recipients` is the sender principal of the original
+  `cmd.output.read.request`.
+- `prev_seq` is required and must equal the OpenEvent seq of the corresponding
+  output read request.
+- `target_seq`, `stream`, `offset`, and `nbytes` must be echoed when valid
+  values can be parsed from the original request. If a field is invalid or
+  missing in the original request, it may be omitted when `status="REJECTED"`.
+- `status` is required and describes the processing result for this partial
+  read request.
+- `bytes` is the byte count actually written to `content`; it is `0` when no
+  file content was read.
+- `content` is required and contains the content read by this request. If
+  `offset` is already at the file size observed at read start, `content` is an
+  empty string, `bytes=0`, and `eof=true`.
+- `content_encoding` is required and must be `utf-8` or `base64`.
+- If the bytes read can be decoded as UTF-8, `content_encoding="utf-8"` and
+  `content` is the decoded string.
+- If the bytes read cannot be decoded as UTF-8, `content_encoding="base64"` and
+  `content` is the base64 string of the raw bytes.
+- If the worker reduces the read size to keep the result payload under the
+  OpenEvent deployment limit, `bytes` is the actual returned byte count. As long
+  as `offset + bytes` has not reached the file size observed at read start,
+  `eof` must be `false`.
+- `eof` indicates whether this read reached the file size observed at read
+  start. The worker opens the file and reads its size first. If
+  `offset + bytes` is greater than or equal to that size, `eof=true`. When the
+  target task is still running, `eof=true` does not mean the task will not write
+  more data later.
+- If the target output file does not exist, the worker writes
+  `status="NOT_FOUND"`, `content=""`, `bytes=0`, `content_encoding="utf-8"`,
+  and `eof=true`.
+- If the target output file exists but the worker cannot stat, open, or read it,
+  the worker writes `status="READ_FAILED"`, `content=""`, `bytes=0`,
+  `content_encoding="utf-8"`, `eof=false`, and `error_message`.
+- If the output read request payload is invalid or exceeds protocol/config
+  limits, the worker writes `status="REJECTED"`, `content=""`, `bytes=0`,
+  `content_encoding="utf-8"`, `eof=true`, and `error_message`, and does not read
+  the output file.
 
-目标文件存在时的成功示例：
+Successful result when the target file exists:
 
 ```json
 {
@@ -374,7 +469,7 @@ worker 对局部读取请求写回内容：
 }
 ```
 
-目标文件不存在时的结果示例：
+Result when the target file does not exist:
 
 ```json
 {
@@ -393,22 +488,24 @@ worker 对局部读取请求写回内容：
 }
 ```
 
-`status` 取值：
+`status` values:
 
-| 状态 | 含义 |
+| Status | Meaning |
 | --- | --- |
-| `SUCCESS` | 读取成功，`content` 是读取到的内容 |
-| `NOT_FOUND` | 目标输出文件不存在 |
-| `READ_FAILED` | 目标输出文件存在但 worker 无法 stat、打开或读取 |
-| `REJECTED` | 输出局部读取请求 payload 非法或超过协议/配置限制，worker 未读取输出文件 |
+| `SUCCESS` | Read succeeded and `content` is the returned content. |
+| `NOT_FOUND` | Target output file does not exist. |
+| `READ_FAILED` | Target output file exists but the worker cannot stat, open, or read it. |
+| `REJECTED` | Output read request payload is invalid or exceeds protocol/configuration limits; the worker did not read the output file. |
 
-## 10. 版本策略
+## 10. Versioning Policy
 
-- `cmd.v1` 不考虑旧 worker 对新字段的兼容；协议字段变化时，文档、SDK 和 worker 同步更新。
-- 破坏性变更必须使用新协议，例如 `cmd.v2`。
+- `cmd.v1` does not support old-worker compatibility for new fields. When
+  protocol fields change, documentation, SDK, and worker are updated together.
+- Breaking changes must use a new protocol, such as `cmd.v2`.
 
-## 11. 已确认协议决策
+## 11. Confirmed Protocol Decisions
 
-- kill 请求和输出局部读取请求的目标任务字段固定使用 `target_seq`。
-- `target_seq` 表示目标 `cmd.run.request` 的 OpenEvent seq，用于避免和 OpenEvent 顶层消息
-  `seq` 混淆。
+- Kill requests and output partial-read requests use `target_seq` as the fixed
+  target task field.
+- `target_seq` is the OpenEvent seq of the target `cmd.run.request`; it avoids
+  confusion with OpenEvent top-level message `seq`.

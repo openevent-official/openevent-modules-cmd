@@ -43,7 +43,7 @@ class WorkerOutputReadTest(unittest.TestCase):
                 seq=124,
                 channel_id=2001,
                 principal=1001,
-                request=CmdOutputReadRequest(target_seq=123, stream="stdout", offset=0, nbytes=4096, ts_ms=1),
+                request=CmdOutputReadRequest(request_id="cmd:agent:s1:wal:100:1", target_seq=123, stream="stdout", offset=0, nbytes=4096, ts_ms=1),
             )
             result = worker._build_output_read_result(event)
             self.assertEqual(result.status, "SUCCESS")

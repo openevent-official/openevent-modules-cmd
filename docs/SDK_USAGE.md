@@ -1,11 +1,14 @@
-# Cmd 协议 SDK 用法
+# Cmd Protocol SDK Usage
 
-> 版本：v0.1  
-> 范围：发布、解析和处理 `cmd.v1` 消息的 Python 调用方。
+[中文版](SDK_USAGE_cn.md)
 
-协议规格见 [CMD_PROTOCOL.md](CMD_PROTOCOL.md)。本文描述 Python SDK 的公开接口。
+> Version: v0.1
+> Scope: Python callers that publish, parse, and handle `cmd.v1` messages.
 
-## 公开接口
+See [CMD_PROTOCOL.md](CMD_PROTOCOL.md) for the protocol specification. This
+document describes the public Python SDK interface.
+
+## Public Interface
 
 ```python
 from openevent.sdk import OpenEventClient
@@ -23,7 +26,12 @@ run_seq = client.publish_run_request(
     principal=1001,
     token="token-1001",
     channel_id=2001,
-    req=CmdRunRequestInput(command="echo hello", workdir="/absolute/path/to/workdir", timeout_ms=300000),
+    req=CmdRunRequestInput(
+        request_id="cmd:agent:s1:wal:100:0",
+        command="echo hello",
+        workdir="/absolute/path/to/workdir",
+        timeout_ms=300000,
+    ),
 )
 
 kill_seq = client.publish_kill_request(
@@ -38,6 +46,7 @@ read_seq = client.publish_output_read_request(
     token="token-1001",
     channel_id=2001,
     req=CmdOutputReadRequestInput(
+        request_id="cmd:agent:s1:wal:100:1",
         target_seq=run_seq,
         stream="stdout",
         offset=0,
@@ -46,7 +55,7 @@ read_seq = client.publish_output_read_request(
 )
 ```
 
-解析消息：
+Parse messages:
 
 ```python
 parsed = client.parse_message(message)
@@ -67,26 +76,40 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
         print(parsed.payload.error_message)
 ```
 
-## 集成说明
+## Integration Notes
 
-- 发布辅助函数统一使用 OpenEvent `PublishAutoSeq`。
-- `cmd.run.request`、`cmd.kill.request` 和 `cmd.output.read.request` 发布时 `recipients` 为空。
-- cmd worker 使用 OpenEvent `Fetch` 拉取消息时必须使用 `only_my_recipient=false`，否则会漏掉
-  `recipients` 为空的请求消息。若当前 `openevent-sdk` 的 `fetch` 支持 `channels` 参数，worker 会把配置的
-  `channel_ids` 传给 `channels`；若当前已安装 SDK 尚不支持该参数，worker 会拉取调用方可见消息后在本地按
-  `channel_ids` 过滤。
-- `CmdRunRequestInput.workdir` 如果传入，必须是绝对路径。
-- `cmd.run.accepted` 和 result 发布辅助函数面向 `cmd-worker`，调用方需要显式传入 recipients。
-- `cmd.run.result` 的 stdout/stderr 对象在 `bytes <= 1024` 时包含 `content`，在
-  `bytes > 1024` 时只包含文件元信息。
-- `content` 出现时必须同时检查 `content_encoding`；值为 `utf-8` 时内容是 UTF-8 字符串，
-  值为 `base64` 时内容是原始字节的 base64 字符串。
-- `cmd.output.read.result.content` 总是写入本次局部读取的内容；目标文件不存在时为空字符串，
-  `content_encoding` 为 `utf-8`。
-- 同一 channel 内成员都可以发布 `cmd.output.read.request` 读取该 channel 内的命令输出。
-- SDK 校验 `cmd.output.read.request.nbytes` 时，只检查它是正整数；实际返回大小由 worker 根据
-  OpenEvent payload 上限控制。
-- SDK 需要能解析各类 result 的 `error_message`；`REJECTED`、`START_FAILED`、`READ_FAILED` 和
-  `RECOVERY_FAILED` 等状态会使用该字段说明原因。
-- SDK 或 worker 做重复确认/result 判断时，以同一 channel 内的 `kind + prev_seq` 为准。
-- SDK 负责校验 payload 结构；channel 归属、命令安全和权限边界由部署负责。
+- Publish helpers use OpenEvent `PublishAutoSeq`.
+- `cmd.run.request`, `cmd.kill.request`, and `cmd.output.read.request` are
+  published with empty `recipients`.
+- `CmdRunRequestInput.request_id` and
+  `CmdOutputReadRequestInput.request_id` are required and are used by callers
+  for recovery and idempotency.
+- The cmd worker must use OpenEvent `Fetch` with `only_my_recipient=false`;
+  otherwise it would miss request messages with empty `recipients`. When the
+  installed `openevent-sdk` supports the `channels` parameter on `fetch`, the
+  worker passes configured `channel_ids` to `channels`. If the installed SDK
+  does not support that parameter, the worker fetches visible messages and
+  filters by `channel_ids` locally.
+- `CmdRunRequestInput.workdir`, when provided, must be an absolute path.
+- `cmd.run.accepted` and result publish helpers are intended for `cmd-worker`;
+  callers must pass recipients explicitly.
+- stdout/stderr objects in `cmd.run.result` include `content` when
+  `bytes <= 1024`; when `bytes > 1024`, they include only file metadata.
+- When `content` is present, callers must also check `content_encoding`.
+  `utf-8` means the content is a UTF-8 string; `base64` means it is the base64
+  representation of the raw bytes.
+- `cmd.output.read.result.content` always contains the bytes returned by that
+  partial read. When the target file does not exist, it is an empty string with
+  `content_encoding="utf-8"`.
+- Any member of a channel can publish `cmd.output.read.request` to read command
+  output in that channel.
+- The SDK only validates that `cmd.output.read.request.nbytes` is a positive
+  integer. The worker controls the actual returned size based on the OpenEvent
+  payload limit.
+- SDK code must be prepared to read `error_message` from result types.
+  `REJECTED`, `START_FAILED`, `READ_FAILED`, and `RECOVERY_FAILED` use this
+  field to explain the reason.
+- Duplicate accepted/result checks should use `kind + prev_seq` within the same
+  channel.
+- The SDK validates payload structure. Channel ownership, command safety, and
+  permission boundaries are deployment responsibilities.
