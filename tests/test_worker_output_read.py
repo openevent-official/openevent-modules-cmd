@@ -25,6 +25,51 @@ class FakePublisher:
 
 
 class WorkerOutputReadTest(unittest.TestCase):
+    def test_run_stops_worker_after_runtime_error(self) -> None:
+        worker = CmdWorker(
+            CmdWorkerConfig(
+                protocol="cmd.v1",
+                open_event=OpenEventConfig(addr="127.0.0.1:9527"),
+                principal=30001,
+                token="token",
+                channel_ids=(2001,),
+                output_dir=Path("cmd-worker-output"),
+            ),
+            FakeClient(),
+        )
+        stopped = []
+        worker.startup = lambda: None
+        worker._drain_completions = lambda: False
+        worker._fetch_round = lambda: (_ for _ in ()).throw(RuntimeError("fetch failed"))
+        worker.stop = lambda: stopped.append(True)
+
+        with self.assertRaisesRegex(RuntimeError, "fetch failed"):
+            worker.run()
+        self.assertEqual(stopped, [True])
+
+    def test_wait_task_reports_internal_error_to_main_thread(self) -> None:
+        class BrokenProcess:
+            def wait(self, timeout=None):
+                del timeout
+                raise RuntimeError("wait failed")
+
+        worker = CmdWorker(
+            CmdWorkerConfig(
+                protocol="cmd.v1",
+                open_event=OpenEventConfig(addr="127.0.0.1:9527"),
+                principal=30001,
+                token="token",
+                channel_ids=(2001,),
+                output_dir=Path("cmd-worker-output"),
+            ),
+            FakeClient(),
+        )
+        task = SimpleNamespace(deadline_ms=10**15, process=BrokenProcess(), channel_id=2001, seq=1)
+        worker._wait_task(task)
+        with self.assertRaisesRegex(RuntimeError, "failed to wait for command") as raised:
+            worker._drain_completions()
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+
     def test_output_read_reduces_bytes_to_fit_payload_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             channel_dir = Path(tmp) / "2001"
@@ -43,7 +88,7 @@ class WorkerOutputReadTest(unittest.TestCase):
                 seq=124,
                 channel_id=2001,
                 principal=1001,
-                request=CmdOutputReadRequest(request_id="cmd:agent:s1:wal:100:1", target_seq=123, stream="stdout", offset=0, nbytes=4096, ts_ms=1),
+                request=CmdOutputReadRequest(target_seq=123, stream="stdout", offset=0, nbytes=4096, ts_ms=1),
             )
             result = worker._build_output_read_result(event)
             self.assertEqual(result.status, "SUCCESS")

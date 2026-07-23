@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import re
 import time
 from pathlib import PurePosixPath
 from typing import Any
@@ -48,9 +47,6 @@ COMMON_KINDS = frozenset(
         KIND_OUTPUT_READ_RESULT,
     }
 )
-REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
-
-
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -84,7 +80,6 @@ def identify_kind(payload: bytes) -> str | None:
 def run_request_input_to_dict(req: CmdRunRequestInput, ts_ms: int | None = None) -> dict[str, Any]:
     data: dict[str, Any] = {
         "kind": KIND_RUN_REQUEST,
-        "request_id": req.request_id,
         "ts_ms": req.ts_ms if req.ts_ms is not None else ts_ms or now_ms(),
         "command": req.command,
     }
@@ -141,7 +136,6 @@ def kill_result_input_to_dict(result: CmdKillResultInput) -> dict[str, Any]:
 def output_read_request_input_to_dict(req: CmdOutputReadRequestInput, ts_ms: int | None = None) -> dict[str, Any]:
     return {
         "kind": KIND_OUTPUT_READ_REQUEST,
-        "request_id": req.request_id,
         "ts_ms": req.ts_ms if req.ts_ms is not None else ts_ms or now_ms(),
         "target_seq": req.target_seq,
         "stream": req.stream,
@@ -181,7 +175,6 @@ def dict_to_model(data: dict[str, Any]):
     kind = data["kind"]
     if kind == KIND_RUN_REQUEST:
         return CmdRunRequest(
-            request_id=data["request_id"],
             command=data["command"],
             workdir=data.get("workdir"),
             timeout_ms=data.get("timeout_ms"),
@@ -208,7 +201,6 @@ def dict_to_model(data: dict[str, Any]):
         return CmdKillResult(prev_seq=data["prev_seq"], target_seq=data.get("target_seq"), ts_ms=data["ts_ms"], status=data["status"], error_message=data.get("error_message"))
     if kind == KIND_OUTPUT_READ_REQUEST:
         return CmdOutputReadRequest(
-            request_id=data["request_id"],
             target_seq=data["target_seq"],
             stream=data["stream"],
             offset=data["offset"],
@@ -245,8 +237,7 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         raise CmdSDKError("INVALID_KIND", "kind is missing or invalid")
     _require_ts(data)
     if kind == KIND_RUN_REQUEST:
-        _reject_unknown(data, {"kind", "request_id", "ts_ms", "command", "workdir", "timeout_ms"})
-        _require_request_id(data)
+        _reject_unknown(data, {"kind", "ts_ms", "command", "workdir", "timeout_ms"})
         _require_non_empty_str(data, "command")
         if "workdir" in data:
             workdir = _require_non_empty_str(data, "workdir")
@@ -308,8 +299,7 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         if status == "REJECTED":
             _require_non_empty_str(data, "error_message")
     elif kind == KIND_OUTPUT_READ_REQUEST:
-        _reject_unknown(data, {"kind", "request_id", "ts_ms", "target_seq", "stream", "offset", "nbytes"})
-        _require_request_id(data)
+        _reject_unknown(data, {"kind", "ts_ms", "target_seq", "stream", "offset", "nbytes"})
         _require_positive_int(data, "target_seq")
         _require_enum(data, "stream", OUTPUT_STREAMS)
         _require_non_negative_int(data, "offset")
@@ -399,13 +389,6 @@ def _validate_content_size(encoding: str, content: str, expected_bytes: int, fie
 
 def _require_ts(data: dict[str, Any]) -> None:
     _require_non_negative_int(data, "ts_ms")
-
-
-def _require_request_id(data: dict[str, Any]) -> str:
-    value = _require_non_empty_str(data, "request_id")
-    if REQUEST_ID_RE.fullmatch(value) is None:
-        raise CmdSDKError("INVALID_REQUEST_ID", "request_id may only contain letters, digits, dot, underscore, colon, or hyphen")
-    return value
 
 
 def _reject_unknown(data: dict[str, Any], allowed: set[str]) -> None:

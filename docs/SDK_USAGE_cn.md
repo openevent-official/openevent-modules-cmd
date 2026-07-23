@@ -26,7 +26,6 @@ run_seq = client.publish_run_request(
     token="token-1001",
     channel_id=2001,
     req=CmdRunRequestInput(
-        request_id="cmd:agent:s1:wal:100:0",
         command="echo hello",
         workdir="/absolute/path/to/workdir",
         timeout_ms=300000,
@@ -45,7 +44,6 @@ read_seq = client.publish_output_read_request(
     token="token-1001",
     channel_id=2001,
     req=CmdOutputReadRequestInput(
-        request_id="cmd:agent:s1:wal:100:1",
         target_seq=run_seq,
         stream="stdout",
         offset=0,
@@ -57,7 +55,9 @@ read_seq = client.publish_output_read_request(
 解析消息：
 
 ```python
-parsed = client.parse_message(message)
+from openevent.cmd_sdk import parse_message
+
+parsed = parse_message(message)
 if parsed.payload.kind == "cmd.run.accepted":
     print(parsed.payload.prev_seq)
 
@@ -79,11 +79,8 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 
 - 发布辅助函数统一使用 OpenEvent `PublishAutoSeq`。
 - `cmd.run.request`、`cmd.kill.request` 和 `cmd.output.read.request` 发布时 `recipients` 为空。
-- `CmdRunRequestInput.request_id` 和 `CmdOutputReadRequestInput.request_id` 必填，用于调用方恢复和幂等去重。
-- cmd worker 使用 OpenEvent `Fetch` 拉取消息时必须使用 `only_my_recipient=false`，否则会漏掉
-  `recipients` 为空的请求消息。若当前 `openevent-sdk` 的 `fetch` 支持 `channels` 参数，worker 会把配置的
-  `channel_ids` 传给 `channels`；若当前已安装 SDK 尚不支持该参数，worker 会拉取调用方可见消息后在本地按
-  `channel_ids` 过滤。
+- cmd worker 使用 OpenEvent `Fetch(only_my_recipient=false, channels=channel_ids)`；否则会漏掉
+  `recipients` 为空的请求消息或处理配置范围外的 channel。
 - `CmdRunRequestInput.workdir` 如果传入，必须是绝对路径。
 - `cmd.run.accepted` 和 result 发布辅助函数面向 `cmd-worker`，调用方需要显式传入 recipients。
 - `cmd.run.result` 的 stdout/stderr 对象在 `bytes <= 1024` 时包含 `content`，在

@@ -106,10 +106,6 @@ class CmdProtocolClient:
         )
         return int(result.seq)
 
-    def parse_message(self, message) -> ParsedMessage:
-        return parse_message(message)
-
-
 def create_client(openevent_client: object) -> CmdProtocolClient:
     return CmdProtocolClient(openevent_client=openevent_client)
 

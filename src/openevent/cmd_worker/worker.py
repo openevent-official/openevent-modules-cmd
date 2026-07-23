@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import base64
-import inspect
 import json
 import logging
+import subprocess
 import threading
 import time
 from collections import deque
@@ -81,6 +81,7 @@ class CompletionEvent:
     seq: int
     return_code: int | None
     status_override: str | None
+    error: Exception | None = None
 
 
 class CmdWorker:
@@ -107,19 +108,21 @@ class CmdWorker:
         self.results: dict[tuple[int, str, int], int | None] = {}
         self.completions: Queue[CompletionEvent] = Queue()
         self.stopping = False
-        self.fetch_supports_channels = _fetch_supports_channels(openevent_client)
 
     def run(self) -> None:
-        self.startup()
-        while not self.stopping:
-            completed = self._drain_completions()
-            messages = self._fetch_round()
-            for message in messages:
-                self._observe_realtime_message(message)
-            self._drain_completions()
-            self._drain_pending()
-            if not messages and not completed and not self.pending:
-                time.sleep(self.config.fetch_idle_sleep_ms / 1000)
+        try:
+            self.startup()
+            while not self.stopping:
+                completed = self._drain_completions()
+                messages = self._fetch_round()
+                for message in messages:
+                    self._observe_realtime_message(message)
+                self._drain_completions()
+                self._drain_pending()
+                if not messages and not completed and not self.pending:
+                    time.sleep(self.config.fetch_idle_sleep_ms / 1000)
+        finally:
+            self.stop()
 
     def stop(self) -> None:
         self.stopping = True
@@ -168,9 +171,12 @@ class CmdWorker:
         attempts = 0
         while True:
             try:
-                kwargs = {"from_seq": from_seq, "limit": 1000, "only_my_recipient": False}
-                if self.fetch_supports_channels:
-                    kwargs["channels"] = self.config.channel_ids
+                kwargs = {
+                    "from_seq": from_seq,
+                    "limit": 1000,
+                    "only_my_recipient": False,
+                    "channels": self.config.channel_ids,
+                }
                 return self.openevent_client.fetch(self.config.principal, self.config.token, **kwargs)
             except Exception:
                 attempts += 1
@@ -274,11 +280,13 @@ class CmdWorker:
         try:
             return_code = task.process.wait(timeout=remaining)
             self.completions.put(CompletionEvent(task.channel_id, task.seq, return_code, task.kill_reason))
-        except Exception:
+        except subprocess.TimeoutExpired:
             task.kill_reason = task.kill_reason or "TIMEOUT"
             self.runner.kill_process_group(task)
             return_code = task.process.wait()
             self.completions.put(CompletionEvent(task.channel_id, task.seq, return_code, task.kill_reason))
+        except Exception as exc:
+            self.completions.put(CompletionEvent(task.channel_id, task.seq, None, None, error=exc))
 
     def _drain_completions(self) -> bool:
         handled = False
@@ -288,6 +296,10 @@ class CmdWorker:
             except Empty:
                 return handled
             handled = True
+            if event.error is not None:
+                raise RuntimeError(
+                    f"failed to wait for command channel_id={event.channel_id} seq={event.seq}"
+                ) from event.error
             task = self.running.pop((event.channel_id, event.seq), None)
             run_event = self.requests.get((event.channel_id, event.seq))
             if task is None or run_event is None or self._has_result(event.channel_id, KIND_RUN_RESULT, event.seq):
@@ -517,10 +529,3 @@ def _best_effort_non_negative_int_from_dict(data: dict, key: str) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
-
-
-def _fetch_supports_channels(openevent_client) -> bool:
-    try:
-        return "channels" in inspect.signature(openevent_client.fetch).parameters
-    except (AttributeError, TypeError, ValueError):
-        return False

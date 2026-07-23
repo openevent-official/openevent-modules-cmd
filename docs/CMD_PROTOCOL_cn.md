@@ -62,7 +62,6 @@ cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的
 ```json
 {
   "kind": "cmd.run.request",
-  "request_id": "cmd:agent:s1:wal:100:0",
   "ts_ms": 1710000000000,
   "command": "echo hello",
   "workdir": "/absolute/path/to/workdir",
@@ -74,7 +73,6 @@ cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的
 
 - OpenEvent `principal` 是业务调用方 principal。
 - OpenEvent `recipients` 必须为空。
-- `request_id` 必填，是调用方生成的请求幂等标识；只能包含字母、数字、点、下划线、冒号和连字符。
 - `command` 必填，是非空字符串，表示要执行的完整 Linux 命令行。
 - worker 使用 Linux shell 执行 `command`；默认等价于 `/bin/sh -c <command>`。
 - `workdir` 可选，是非空字符串，表示命令执行工作目录；缺失时使用 worker 当前工作目录。
@@ -286,7 +284,6 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 ```json
 {
   "kind": "cmd.output.read.request",
-  "request_id": "cmd:agent:s1:wal:100:1",
   "ts_ms": 1710000002000,
   "target_seq": 12345,
   "stream": "stdout",
@@ -299,7 +296,6 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 
 - OpenEvent `principal` 是查询方 principal。
 - OpenEvent `recipients` 必须为空。
-- `request_id` 必填，是调用方生成的请求幂等标识；只能包含字母、数字、点、下划线、冒号和连字符。
 - `target_seq` 必填，必须是目标 `cmd.run.request` 的 OpenEvent seq。
 - `stream` 必填，只能是 `stdout` 或 `stderr`。
 - `offset` 必填，必须是非负整数，表示从输出文件第几个字节开始读。

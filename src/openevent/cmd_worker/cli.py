@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 
 from openevent.sdk import OpenEventClient
 
 from .config import ConfigError, load_config
 from .worker import CmdWorker
+
+
+class _StopRequested(Exception):
+    pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,11 +32,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     client = OpenEventClient(config.open_event.addr)
     worker = CmdWorker(config, client)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_stop(signum, frame):
+        del signum, frame
+        raise _StopRequested
+
+    signal.signal(signal.SIGTERM, request_stop)
     try:
         worker.run()
     except KeyboardInterrupt:
-        worker.stop()
         return 130
+    except _StopRequested:
+        return 143
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
 
 

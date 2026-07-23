@@ -72,7 +72,6 @@ explain the rejection.
 ```json
 {
   "kind": "cmd.run.request",
-  "request_id": "cmd:agent:s1:wal:100:0",
   "ts_ms": 1710000000000,
   "command": "echo hello",
   "workdir": "/absolute/path/to/workdir",
@@ -84,8 +83,6 @@ Rules:
 
 - OpenEvent `principal` is the business caller principal.
 - OpenEvent `recipients` must be empty.
-- `request_id` is required. It is a caller-generated idempotency identifier and
-  may contain only letters, digits, dots, underscores, colons, and hyphens.
 - `command` is required. It must be a non-empty string containing the full Linux
   command line to execute.
 - The worker executes `command` through the Linux shell; by default this is
@@ -350,7 +347,6 @@ worker-local `output_dir/<channel_id>/`.
 ```json
 {
   "kind": "cmd.output.read.request",
-  "request_id": "cmd:agent:s1:wal:100:1",
   "ts_ms": 1710000002000,
   "target_seq": 12345,
   "stream": "stdout",
@@ -363,8 +359,6 @@ Rules:
 
 - OpenEvent `principal` is the querying principal.
 - OpenEvent `recipients` must be empty.
-- `request_id` is required. It is a caller-generated idempotency identifier and
-  may contain only letters, digits, dots, underscores, colons, and hyphens.
 - `target_seq` is required and must be the OpenEvent seq of the target
   `cmd.run.request`.
 - `stream` is required and must be either `stdout` or `stderr`.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import inspect
 import time
 from dataclasses import dataclass
 
@@ -32,8 +31,6 @@ class PublishFatal(RuntimeError):
 @dataclass(frozen=True)
 class Published:
     seq: int | None
-    kind: str
-    prev_seq: int
 
 
 class ReliablePublisher:
@@ -54,12 +51,10 @@ class ReliablePublisher:
         self.channel_ids = channel_ids
         self.fetch_error_max_retries = fetch_error_max_retries
         self.fetch_error_retry_sleep_ms = fetch_error_retry_sleep_ms
-        self.fetch_supports_channels = _fetch_supports_channels(openevent_client)
 
     def publish_run_accepted(self, channel_id: int, request_principal: int, prev_seq: int, check_from_seq: int) -> Published:
         return self._publish_with_check(
             channel_id,
-            request_principal,
             KIND_RUN_ACCEPTED,
             prev_seq,
             check_from_seq,
@@ -69,7 +64,6 @@ class ReliablePublisher:
     def publish_run_result(self, channel_id: int, request_principal: int, result: CmdRunResultInput, check_from_seq: int) -> Published:
         return self._publish_with_check(
             channel_id,
-            request_principal,
             KIND_RUN_RESULT,
             result.prev_seq,
             check_from_seq,
@@ -79,7 +73,6 @@ class ReliablePublisher:
     def publish_kill_result(self, channel_id: int, request_principal: int, result: CmdKillResultInput, check_from_seq: int) -> Published:
         return self._publish_with_check(
             channel_id,
-            request_principal,
             KIND_KILL_RESULT,
             result.prev_seq,
             check_from_seq,
@@ -95,33 +88,36 @@ class ReliablePublisher:
     ) -> Published:
         return self._publish_with_check(
             channel_id,
-            request_principal,
             KIND_OUTPUT_READ_RESULT,
             result.prev_seq,
             check_from_seq,
             lambda: self.protocol_client.publish_output_read_result(self.principal, self.token, channel_id, request_principal, result),
         )
 
-    def _publish_with_check(self, channel_id: int, request_principal: int, kind: str, prev_seq: int, check_from_seq: int, publish_call) -> Published:
-        del request_principal
+    def _publish_with_check(self, channel_id: int, kind: str, prev_seq: int, check_from_seq: int, publish_call) -> Published:
         try:
-            return Published(seq=publish_call(), kind=kind, prev_seq=prev_seq)
+            return Published(seq=publish_call())
         except Exception as exc:  # pragma: no cover - exercised with integration tests
             LOG.warning("publish returned error; checking whether message was committed", extra={"kind": kind, "prev_seq": prev_seq, "error": repr(exc)})
         existing = self._find_existing(channel_id, kind, prev_seq, max(1, check_from_seq))
         if existing is not None:
-            return Published(seq=existing, kind=kind, prev_seq=prev_seq)
+            return Published(seq=existing)
         try:
-            return Published(seq=publish_call(), kind=kind, prev_seq=prev_seq)
+            return Published(seq=publish_call())
         except Exception as exc:
             raise PublishFatal(f"failed to publish {kind} for prev_seq={prev_seq}") from exc
 
     def _find_existing(self, channel_id: int, kind: str, prev_seq: int, from_seq: int) -> int | None:
         current = max(1, from_seq)
+        scan_last_seq: int | None = None
+        found: int | None = None
         while True:
             response = self._fetch_with_retries(current)
-            found: int | None = None
+            if scan_last_seq is None:
+                scan_last_seq = int(response.last_seq)
             for message in response.messages:
+                if int(message.seq) > scan_last_seq:
+                    continue
                 if int(message.channel_id) != channel_id:
                     continue
                 try:
@@ -130,15 +126,12 @@ class ReliablePublisher:
                     continue
                 payload = parsed.payload
                 if _matches_kind_prev(payload, kind, prev_seq):
-                    if found is not None:
+                    if found is not None and found != parsed.seq:
                         raise PublishFatal(f"duplicate {kind} for prev_seq={prev_seq}")
                     found = parsed.seq
-            if found is not None:
+            next_seq = min(int(response.next_seq), scan_last_seq + 1)
+            if next_seq > scan_last_seq:
                 return found
-            next_seq = int(response.next_seq)
-            last_seq = int(response.last_seq)
-            if next_seq > last_seq:
-                return None
             if next_seq <= current:
                 raise PublishFatal("Fetch did not advance while checking published message")
             current = next_seq
@@ -147,9 +140,12 @@ class ReliablePublisher:
         attempts = 0
         while True:
             try:
-                kwargs = {"from_seq": from_seq, "limit": 1000, "only_my_recipient": False}
-                if self.fetch_supports_channels:
-                    kwargs["channels"] = self.channel_ids
+                kwargs = {
+                    "from_seq": from_seq,
+                    "limit": 1000,
+                    "only_my_recipient": False,
+                    "channels": self.channel_ids,
+                }
                 return self.openevent_client.fetch(self.principal, self.token, **kwargs)
             except Exception:
                 attempts += 1
@@ -168,10 +164,3 @@ def _matches_kind_prev(payload, kind: str, prev_seq: int) -> bool:
     if kind == KIND_OUTPUT_READ_RESULT and isinstance(payload, CmdOutputReadResult):
         return payload.prev_seq == prev_seq
     return False
-
-
-def _fetch_supports_channels(openevent_client) -> bool:
-    try:
-        return "channels" in inspect.signature(openevent_client.fetch).parameters
-    except (AttributeError, TypeError, ValueError):
-        return False

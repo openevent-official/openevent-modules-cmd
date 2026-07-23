@@ -9,7 +9,7 @@ OpenEvent 写入命令请求，worker 将每个请求作为异步 subprocess 执
 ## 运行前提
 
 - Python 3.10 或更高版本。
-- 当前 Python 环境中可解析的 `openevent-sdk>=0.3.0`。
+- 当前 Python 环境中可解析的 `openevent-sdk>=0.4.1`。
 - 已运行的 OpenEvent server。
 - 已提前创建 `protocol="cmd.v1"` 的非 public channel。
 - cmd-worker principal 和业务调用方 principal 都必须是目标 channel 成员。
@@ -24,7 +24,7 @@ make build
 make install
 ```
 
-`make test` 使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.3.0`，不会从 SDK 子模块安装或生成 SDK。
+`make test` 使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.4.1`，不会从 SDK 子模块安装或生成 SDK。
 构建产物写入 `dist/`，临时文件写入 `build/`。
 
 ## 安全边界
@@ -56,15 +56,13 @@ cmd-worker --config cmd-worker.yaml
 
 - 协议版本：`cmd.v1`
 - Python 版本：`>=3.10`
-- OpenEvent SDK：`openevent-sdk>=0.3.0`
+- OpenEvent SDK：`openevent-sdk>=0.4.1`
 - 默认命令超时：`300000` 毫秒
 - 默认并发上限：`8`
 - worker 配置必须显式指定 `channel_ids`；worker 只处理这些 channel 中的消息
 - 配置中的 channel 必须是 `cmd.v1`、非 public、且 cmd-worker principal 是成员；public channel 会导致
   worker 启动失败并退出
-- worker 使用 OpenEvent `Fetch(only_my_recipient=false)` 拉取消息；当前 SDK 支持 `channels` 参数时会传入
-  配置的 `channel_ids`，否则在本地过滤 channel
-- `cmd.run.request` 和 `cmd.output.read.request` 都必须包含调用方生成的 `request_id`，用于恢复和幂等去重
+- worker 使用 OpenEvent `Fetch(only_my_recipient=false, channels=channel_ids)` 拉取配置 channel 的消息
 - 命令执行方式：`command` 字符串，由 Linux shell 执行
 - 命令工作目录：`workdir` 可选；如果出现，必须是绝对路径
 - 命令请求不支持独立的 `env` 或 `stdin` 字段
@@ -73,7 +71,7 @@ cmd-worker --config cmd-worker.yaml
 - `cmd.run.result` 输出规则：stdout/stderr 大于 1024 字节只写文件元信息，小于等于
   1024 字节直接写内容
 - 输出内容能按 UTF-8 解码时 `content_encoding=utf-8`，否则 `content_encoding=base64`
-- 输出局部查询：`cmd.output.read.request(request_id, target_seq, stream, offset, nbytes)`，
+- 输出局部查询：`cmd.output.read.request(target_seq, stream, offset, nbytes)`，
   结果通过 `cmd.output.read.result.content` 返回；worker 可为保证 result payload 不超过
   OpenEvent 部署上限而少于 `nbytes` 返回
 - 同一 channel 内成员都可以读取该 channel 内的命令输出

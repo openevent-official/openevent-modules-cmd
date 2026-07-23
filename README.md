@@ -11,7 +11,7 @@ reads of output files through OpenEvent messages.
 ## Requirements
 
 - Python 3.10 or later.
-- `openevent-sdk>=0.3.0` importable in the current Python environment.
+- `openevent-sdk>=0.4.1` importable in the current Python environment.
 - A running OpenEvent server.
 - A pre-created non-public channel with `protocol="cmd.v1"`.
 - The cmd-worker principal and business caller principals must be members of the
@@ -28,7 +28,7 @@ make build
 make install
 ```
 
-`make test` uses the `openevent-sdk>=0.3.0` already installed in the current
+`make test` uses the `openevent-sdk>=0.4.1` already installed in the current
 Python environment. It does not install the SDK from a submodule or generate SDK
 proto files. Build artifacts are written to `dist/`; temporary files are written
 to `build/`.
@@ -69,7 +69,7 @@ OpenEvent channels, tokens, members, and ACLs must be prepared separately.
 
 - Protocol version: `cmd.v1`
 - Python version: `>=3.10`
-- OpenEvent SDK: `openevent-sdk>=0.3.0`
+- OpenEvent SDK: `openevent-sdk>=0.4.1`
 - Default command timeout: `300000` ms
 - Default concurrency limit: `8`
 - Worker configuration must explicitly set `channel_ids`; the worker only
@@ -78,11 +78,8 @@ OpenEvent channels, tokens, members, and ACLs must be prepared separately.
   the cmd-worker principal as a member. A public channel makes worker startup
   fail.
 - The worker fetches messages with OpenEvent `Fetch(only_my_recipient=false)`.
-  When the installed SDK supports the `channels` fetch parameter, the worker
-  passes configured `channel_ids`; otherwise it fetches visible messages and
-  filters channels locally.
-- `cmd.run.request` and `cmd.output.read.request` must both include a
-  caller-generated `request_id` for recovery and idempotency.
+  The worker always passes configured `channel_ids` through the `channels`
+  parameter.
 - Command execution uses the `command` string through the Linux shell.
 - `workdir` is optional; when present, it must be an absolute path.
 - Command requests do not support separate `env` or `stdin` fields.
@@ -93,7 +90,7 @@ OpenEvent channels, tokens, members, and ACLs must be prepared separately.
 - Output content uses `content_encoding=utf-8` when it can be decoded as UTF-8;
   otherwise it uses `content_encoding=base64`.
 - Partial output reads use
-  `cmd.output.read.request(request_id, target_seq, stream, offset, nbytes)` and
+  `cmd.output.read.request(target_seq, stream, offset, nbytes)` and
   return content through `cmd.output.read.result.content`. The worker may return
   fewer than `nbytes` bytes to keep the result payload under the OpenEvent
   deployment limit.

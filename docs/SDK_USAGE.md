@@ -27,7 +27,6 @@ run_seq = client.publish_run_request(
     token="token-1001",
     channel_id=2001,
     req=CmdRunRequestInput(
-        request_id="cmd:agent:s1:wal:100:0",
         command="echo hello",
         workdir="/absolute/path/to/workdir",
         timeout_ms=300000,
@@ -46,7 +45,6 @@ read_seq = client.publish_output_read_request(
     token="token-1001",
     channel_id=2001,
     req=CmdOutputReadRequestInput(
-        request_id="cmd:agent:s1:wal:100:1",
         target_seq=run_seq,
         stream="stdout",
         offset=0,
@@ -55,10 +53,12 @@ read_seq = client.publish_output_read_request(
 )
 ```
 
-Parse messages:
+Parse messages with the module-level helper:
 
 ```python
-parsed = client.parse_message(message)
+from openevent.cmd_sdk import parse_message
+
+parsed = parse_message(message)
 if parsed.payload.kind == "cmd.run.accepted":
     print(parsed.payload.prev_seq)
 
@@ -81,15 +81,9 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 - Publish helpers use OpenEvent `PublishAutoSeq`.
 - `cmd.run.request`, `cmd.kill.request`, and `cmd.output.read.request` are
   published with empty `recipients`.
-- `CmdRunRequestInput.request_id` and
-  `CmdOutputReadRequestInput.request_id` are required and are used by callers
-  for recovery and idempotency.
-- The cmd worker must use OpenEvent `Fetch` with `only_my_recipient=false`;
-  otherwise it would miss request messages with empty `recipients`. When the
-  installed `openevent-sdk` supports the `channels` parameter on `fetch`, the
-  worker passes configured `channel_ids` to `channels`. If the installed SDK
-  does not support that parameter, the worker fetches visible messages and
-  filters by `channel_ids` locally.
+- The cmd worker uses OpenEvent `Fetch` with `only_my_recipient=false` and
+  passes configured `channel_ids` through `channels`; otherwise it would miss
+  request messages with empty `recipients` or process channels outside its scope.
 - `CmdRunRequestInput.workdir`, when provided, must be an absolute path.
 - `cmd.run.accepted` and result publish helpers are intended for `cmd-worker`;
   callers must pass recipients explicitly.

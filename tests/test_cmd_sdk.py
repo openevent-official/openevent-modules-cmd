@@ -19,14 +19,13 @@ class CmdSDKTest(unittest.TestCase):
     def test_run_request_round_trip(self) -> None:
         payload = dumps_payload(
             run_request_input_to_dict(
-                CmdRunRequestInput(request_id="cmd:agent:s1:wal:100:0", command="echo hello", workdir="/tmp", timeout_ms=1000, ts_ms=123)
+                CmdRunRequestInput(command="echo hello", workdir="/tmp", timeout_ms=1000, ts_ms=123)
             )
         )
         self.assertEqual(
             loads_payload(payload),
             {
                 "kind": "cmd.run.request",
-                "request_id": "cmd:agent:s1:wal:100:0",
                 "ts_ms": 123,
                 "command": "echo hello",
                 "workdir": "/tmp",
@@ -36,13 +35,12 @@ class CmdSDKTest(unittest.TestCase):
 
     def test_relative_workdir_is_rejected(self) -> None:
         with self.assertRaises(CmdSDKError):
-            dumps_payload(run_request_input_to_dict(CmdRunRequestInput(request_id="cmd:1", command="pwd", workdir="relative", ts_ms=1)))
+            dumps_payload(run_request_input_to_dict(CmdRunRequestInput(command="pwd", workdir="relative", ts_ms=1)))
 
     def test_output_read_request_round_trip(self) -> None:
         payload = dumps_payload(
             output_read_request_input_to_dict(
                 CmdOutputReadRequestInput(
-                    request_id="cmd:agent:s1:wal:100:1",
                     target_seq=10,
                     stream="stdout",
                     offset=0,
@@ -56,7 +54,6 @@ class CmdSDKTest(unittest.TestCase):
             loads_payload(payload),
             {
                 "kind": "cmd.output.read.request",
-                "request_id": "cmd:agent:s1:wal:100:1",
                 "ts_ms": 123,
                 "target_seq": 10,
                 "stream": "stdout",
@@ -117,6 +114,10 @@ class CmdSDKTest(unittest.TestCase):
     def test_unknown_field_is_rejected(self) -> None:
         with self.assertRaises(CmdSDKError):
             loads_payload(b'{"kind":"cmd.kill.request","ts_ms":1,"target_seq":2,"extra":true}')
+
+    def test_request_id_is_rejected_as_an_unknown_field(self) -> None:
+        with self.assertRaises(CmdSDKError):
+            loads_payload(b'{"kind":"cmd.run.request","request_id":"old","ts_ms":1,"command":"true"}')
 
 
 if __name__ == "__main__":
