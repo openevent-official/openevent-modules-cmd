@@ -2,7 +2,7 @@ PYTHON ?= python3
 TEST_ARGS ?=
 INSTALL_ARGS ?=
 
-.PHONY: help build install test e2e clean
+.PHONY: help build install test check-sdk check-docs e2e clean
 
 help:
 	@printf 'Usage: make <target>\n\n'
@@ -10,7 +10,9 @@ help:
 	@printf '  build    Build artifacts without installing into the current Python environment\n'
 	@printf '  install  Build and install the generated wheel with pip\n'
 	@printf '  test     Run unit tests with temporary files under build/\n'
-	@printf '  e2e      Run end-to-end tests with real OpenEvent server\n'
+	@printf '  check-sdk  Check the installed SDK dependency\n'
+	@printf '  check-docs  Check documentation links, translations, and dependency versions\n'
+	@printf '  e2e      Report that end-to-end tests are not implemented\n'
 	@printf '  clean    Remove build artifacts and temporary work files\n\n'
 	@printf 'Variables:\n'
 	@printf '  PYTHON=%s\n' '$(PYTHON)'
@@ -20,15 +22,16 @@ build:
 	PYTHON="$(PYTHON)" ./build.sh
 
 install: build
-	@wheel="$$(find "dist" -maxdepth 1 -type f -name '*.whl' | sort | tail -n 1)"; \
-	if [ -z "$$wheel" ]; then \
-	  printf 'no wheel found in dist\n'; \
-	  exit 1; \
-	fi; \
-	"$(PYTHON)" -m pip install $(INSTALL_ARGS) "$$wheel"
+	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" scripts/install.py $(INSTALL_ARGS)
 
 test:
 	PYTHON="$(PYTHON)" ./test.sh $(TEST_ARGS)
+
+check-docs:
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src "$(PYTHON)" scripts/check_docs.py
+
+check-sdk:
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src "$(PYTHON)" -c 'from openevent.cmd_sdk.dependencies import require_sdk; require_sdk()'
 
 e2e:
 	PYTHON="$(PYTHON)" ./test-e2e.sh $(TEST_ARGS)

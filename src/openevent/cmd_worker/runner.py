@@ -4,8 +4,9 @@ import base64
 import os
 import signal
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openevent.cmd_sdk.model import CmdOutput
@@ -28,6 +29,8 @@ class RunningCommand:
     timeout_ms: int
     deadline_ms: int
     kill_reason: str | None = None
+    termination_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    return_code: int | None = field(default=None, init=False)
 
 
 class CommandRunner:
@@ -41,12 +44,6 @@ class CommandRunner:
         probe.unlink()
 
     def start(self, channel_id: int, seq: int, command: str, workdir: str | None, timeout_ms: int, deadline_ms: int) -> RunningCommand:
-        cwd: str | None = None
-        if workdir is not None:
-            path = Path(workdir)
-            if not path.is_dir():
-                raise CommandStartError("workdir does not exist or is not a directory")
-            cwd = str(path)
         channel_dir = self.output_dir / str(channel_id)
         try:
             channel_dir.mkdir(parents=True, exist_ok=True)
@@ -62,13 +59,13 @@ class CommandRunner:
             process = subprocess.Popen(
                 command,
                 shell=True,
-                cwd=cwd,
+                cwd=workdir,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 start_new_session=True,
                 close_fds=True,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise CommandStartError(f"cannot open output files or start shell process: {exc}") from exc
         finally:
             if stdout_file is not None:
@@ -86,15 +83,55 @@ class CommandRunner:
             deadline_ms=deadline_ms,
         )
 
-    def kill_process_group(self, task: RunningCommand) -> None:
-        if task.process.poll() is not None:
-            return
-        try:
-            os.killpg(os.getpgid(task.process.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except OSError:
-            task.process.kill()
+    def poll(self, task: RunningCommand) -> int | None:
+        with task.termination_lock:
+            return self._poll_locked(task)
+
+    def wait(self, task: RunningCommand, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            return_code = self.poll(task)
+            if return_code is not None:
+                return return_code
+            delay = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(task.process.args, timeout)
+                delay = min(delay, remaining)
+            time.sleep(delay)
+
+    def terminate(self, task: RunningCommand, reason: str) -> bool:
+        with task.termination_lock:
+            if self._poll_locked(task) is not None:
+                return False
+            try:
+                os.killpg(task.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return False
+            task.kill_reason = task.kill_reason or reason
+            return True
+
+    def _poll_locked(self, task: RunningCommand) -> int | None:
+        if task.return_code is None:
+            status = os.waitid(os.P_PID, task.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if status is None:
+                return None
+            # Keep the exited leader waitable until its group has been signaled,
+            # so the PID/PGID cannot be recycled before this final cleanup.
+            try:
+                os.killpg(task.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            task.return_code = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+        # Cache before reaping: an interrupt during wait() must never cause a
+        # later call to signal the old numeric PGID again.
+        if task.process.returncode is None:
+            task.process.wait()
+        # wait() can lose the exit status if interrupted after waitpid reaped
+        # the child; the WNOWAIT observation remains the authoritative value.
+        task.process.returncode = task.return_code
+        return task.return_code
 
     def output_for(self, channel_id: int, seq: int, stream: str) -> CmdOutput:
         suffix = "stdout" if stream == "stdout" else "stderr"
@@ -108,18 +145,15 @@ def now_ms() -> int:
 
 def output_object(path: Path, channel_id: int, seq: int, stream: str) -> CmdOutput:
     rel_file = f"{channel_id}/{seq}.{stream}"
-    if not path.exists():
-        return empty_output(rel_file)
     try:
-        size = path.stat().st_size
+        with path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size > INLINE_OUTPUT_BYTES:
+                return CmdOutput(file=rel_file, bytes=size)
+            data = handle.read(min(size, INLINE_OUTPUT_BYTES))
     except OSError:
         return empty_output(rel_file)
-    if size > INLINE_OUTPUT_BYTES:
-        return CmdOutput(file=rel_file, bytes=size)
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return empty_output(rel_file)
+    size = len(data)
     try:
         content = data.decode("utf-8")
         return CmdOutput(file=rel_file, bytes=size, content_encoding="utf-8", content=content)

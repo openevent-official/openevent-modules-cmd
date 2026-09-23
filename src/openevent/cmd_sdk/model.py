@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+MAX_TIMEOUT_MS = 2**64 - 1
+
 KIND_RUN_REQUEST = "cmd.run.request"
 KIND_RUN_ACCEPTED = "cmd.run.accepted"
 KIND_RUN_RESULT = "cmd.run.result"

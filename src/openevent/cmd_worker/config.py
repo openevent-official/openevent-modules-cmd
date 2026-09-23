@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from openevent.cmd_sdk.model import MAX_TIMEOUT_MS
+
 DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+MIN_PAYLOAD_BYTES = 16 * 1024
 DEFAULT_OUTPUT_DIR = "cmd-worker-output"
 DEFAULT_MAX_CONCURRENT_TASKS = 8
 DEFAULT_TIMEOUT_MS = 300000
@@ -72,7 +75,12 @@ def parse_config(data: dict[str, Any]) -> CmdWorkerConfig:
     open_event_data = _required_dict(data, "open_event")
     _reject_unknown(open_event_data, {"addr", "max_payload_bytes"})
     max_payload_bytes = _optional_positive_int(open_event_data, "max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)
+    if max_payload_bytes < MIN_PAYLOAD_BYTES:
+        raise ConfigError(f"open_event.max_payload_bytes must be at least {MIN_PAYLOAD_BYTES} (16 KiB)")
     channel_ids = _parse_channel_ids(data.get("channel_ids"))
+    default_timeout_ms = _optional_positive_int(data, "default_timeout_ms", DEFAULT_TIMEOUT_MS)
+    if default_timeout_ms > MAX_TIMEOUT_MS:
+        raise ConfigError(f"default_timeout_ms must be in 1..{MAX_TIMEOUT_MS}")
     return CmdWorkerConfig(
         protocol=protocol,
         open_event=OpenEventConfig(addr=_required_str(open_event_data, "addr"), max_payload_bytes=max_payload_bytes),
@@ -81,7 +89,7 @@ def parse_config(data: dict[str, Any]) -> CmdWorkerConfig:
         channel_ids=channel_ids,
         output_dir=Path(_optional_str(data, "output_dir", DEFAULT_OUTPUT_DIR)),
         max_concurrent_tasks=_optional_positive_int(data, "max_concurrent_tasks", DEFAULT_MAX_CONCURRENT_TASKS),
-        default_timeout_ms=_optional_positive_int(data, "default_timeout_ms", DEFAULT_TIMEOUT_MS),
+        default_timeout_ms=default_timeout_ms,
         fetch_idle_sleep_ms=_optional_positive_int(data, "fetch_idle_sleep_ms", DEFAULT_FETCH_IDLE_SLEEP_MS),
         fetch_error_max_retries=_optional_positive_int(data, "fetch_error_max_retries", DEFAULT_FETCH_ERROR_MAX_RETRIES),
         fetch_error_retry_sleep_ms=_optional_positive_int(data, "fetch_error_retry_sleep_ms", DEFAULT_FETCH_ERROR_RETRY_SLEEP_MS),

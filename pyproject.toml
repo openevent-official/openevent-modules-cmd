@@ -8,8 +8,9 @@ version = "0.1.0"
 description = "OpenEvent cmd.v1 protocol SDK and command worker"
 requires-python = ">=3.10"
 dependencies = [
-    "openevent-sdk>=0.4.1",
+    "openevent-sdk>=0.8.1",
     "PyYAML>=6.0",
+    "packaging>=23",
 ]
 
 [project.scripts]

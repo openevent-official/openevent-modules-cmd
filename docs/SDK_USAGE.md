@@ -78,32 +78,34 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 
 ## Integration Notes
 
-- Publish helpers use OpenEvent `PublishAutoSeq`.
-- `cmd.run.request`, `cmd.kill.request`, and `cmd.output.read.request` are
-  published with empty `recipients`.
-- The cmd worker uses OpenEvent `Fetch` with `only_my_recipient=false` and
-  passes configured `channel_ids` through `channels`; otherwise it would miss
-  request messages with empty `recipients` or process channels outside its scope.
-- `CmdRunRequestInput.workdir`, when provided, must be an absolute path.
-- `cmd.run.accepted` and result publish helpers are intended for `cmd-worker`;
-  callers must pass recipients explicitly.
-- stdout/stderr objects in `cmd.run.result` include `content` when
-  `bytes <= 1024`; when `bytes > 1024`, they include only file metadata.
-- When `content` is present, callers must also check `content_encoding`.
-  `utf-8` means the content is a UTF-8 string; `base64` means it is the base64
-  representation of the raw bytes.
-- `cmd.output.read.result.content` always contains the bytes returned by that
-  partial read. When the target file does not exist, it is an empty string with
-  `content_encoding="utf-8"`.
-- Any member of a channel can publish `cmd.output.read.request` to read command
-  output in that channel.
-- The SDK only validates that `cmd.output.read.request.nbytes` is a positive
-  integer. The worker controls the actual returned size based on the OpenEvent
-  payload limit.
-- SDK code must be prepared to read `error_message` from result types.
-  `REJECTED`, `START_FAILED`, `READ_FAILED`, and `RECOVERY_FAILED` use this
-  field to explain the reason.
-- Duplicate accepted/result checks should use `kind + prev_seq` within the same
-  channel.
-- The SDK validates payload structure. Channel ownership, command safety, and
-  permission boundaries are deployment responsibilities.
+- Publish methods return the integer message seq and use OpenEvent
+  `PublishAutoSeq`. Request methods set empty recipients automatically.
+- Every publish method accepts the optional keyword argument `uuid`. If omitted,
+  the installed OpenEvent SDK allocates a UUID; otherwise the supplied value is
+  used. These helpers do not retry automatically. UUID reuse and message
+  consistency follow the OpenEvent SDK API contract.
+- `parse_message(message)` returns `ParsedMessage` with top-level seq, channel_id,
+  principal, recipients, and a validated payload model. Invalid payloads raise
+  `CmdSDKError`, exposing `code` and `message`; OpenEvent RPC errors propagate
+  unchanged.
+- Output content, encoding, states, and field rules are defined in the
+  [protocol](CMD_PROTOCOL.md). Read `content_encoding` alongside content.
+- The worker uses `Fetch(only_my_recipient=false, channels=channel_ids)` to read
+  requests and results from configured channels.
+
+## Worker Publish Interface
+
+These methods are intended for workers. `request_principal` is the original
+request sender. The helper sets `recipients=[request_principal]`; there is no
+argument named `recipients`.
+
+```text
+client.publish_run_accepted(principal, token, channel_id, request_principal, prev_seq, *, uuid=None)
+client.publish_run_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+client.publish_kill_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+client.publish_output_read_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+```
+
+These are method signatures. The three `result_payload` arguments use
+`CmdRunResultInput`, `CmdKillResultInput`, and `CmdOutputReadResultInput`,
+respectively. Like request methods, they return an integer seq.

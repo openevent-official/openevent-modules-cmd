@@ -66,6 +66,12 @@ must write the corresponding result with `status="REJECTED"`. If the payload is
 too damaged to identify the request kind, the worker can only log the error and
 ignore it. Every result with `status="REJECTED"` must include `error_message` to
 explain the rejection.
+Worker-generated error messages use at most 512 UTF-8 bytes and are shortened at
+complete character boundaries when necessary. See the
+[configuration document](CONFIGURATION.md#fields) for the minimum supported
+deployment payload limit. All accepted/result payloads are checked after encoding
+and before publication. Partial reads reduce their size as described in sections
+8 and 9; other results that cannot fit cause the worker to fail and exit.
 
 ## 3. `cmd.run.request`
 
@@ -87,6 +93,8 @@ Rules:
   command line to execute.
 - The worker executes `command` through the Linux shell; by default this is
   equivalent to `/bin/sh -c <command>`.
+  See [Task Process Lifecycle](CONFIGURATION.md#task-process-lifecycle) for group
+  cleanup, shell reaping order, and the scope of process management.
 - `workdir` is optional. It is a non-empty string describing the command working
   directory. If absent, the worker uses its current working directory.
 - When present, `workdir` must be an absolute path.
@@ -94,11 +102,11 @@ Rules:
   entered due to permissions, or causes the shell process to fail to start, the
   payload itself is not invalid. The worker writes
   `cmd.run.result(status=START_FAILED)` with `error_message`.
-- `timeout_ms` is optional and must be a positive integer. If absent, the worker
-  uses the configured default timeout.
-- Missing `timeout_ms` always uses the default timeout configuration active when
-  the worker handles that request. This also applies when startup recovery
-  handles historical run requests that were not accepted.
+- `timeout_ms` is optional and must be an integer in
+  `1..18446744073709551615` (`2**64-1`). If omitted, the worker uses the default
+  active when it handles the request. Startup recovery also uses the current
+  configuration, including when generating `RECOVERY_FAILED`. See the
+  [runtime notes](CONFIGURATION.md#recovery-and-exit) for recovery behavior.
 - The timeout deadline is computed from the OpenEvent top-level
   `EventMessage.ts_ms` of this `cmd.run.request` plus `timeout_ms`. If
   `timeout_ms` is absent, the configured default timeout is used. The payload
@@ -130,6 +138,10 @@ Rules:
 - `prev_seq` is required and must equal the OpenEvent seq of the corresponding
   run request.
 - `cmd.run.accepted` must be written before the command process starts.
+- After accepted is confirmed, the worker checks the deadline again. If it
+  expired during publication, the worker does not start a process and writes
+  `cmd.run.result(status=TIMEOUT)`. Accepted therefore does not guarantee that
+  the command has started.
 - If the run request is invalid, the worker does not write `cmd.run.accepted`;
   it writes `cmd.run.result(status=REJECTED)` directly.
 - If the run request expires before obtaining an execution slot, the worker does
@@ -171,18 +183,22 @@ Rules:
 - `stdout.file` is fixed to `<channel_id>/<prev_seq>.stdout`; `stderr.file` is
   fixed to `<channel_id>/<prev_seq>.stderr`. `file` is relative to `output_dir`.
 - stdout and stderr are evaluated independently with a 1024-byte threshold:
-  - When `bytes <= 1024`, `content` is required and contains the full content of
-    that output file.
+  - When `bytes <= 1024`, `content` is required and contains the full content
+    within this read's range, defined in the next section.
   - When `bytes > 1024`, `content` must be absent and only file metadata is
     written.
 - The actual output root is configured by worker `output_dir`.
-- `timeout_ms` is the effective timeout used for this run request. It is
-  required except when `status="REJECTED"` and the effective timeout cannot be
-  determined.
+- `timeout_ms` is the effective timeout chosen while handling this run request,
+  in `1..18446744073709551615` (`2**64-1`). It is required except when
+  `status="REJECTED"` and the effective timeout cannot be determined.
+  `RECOVERY_FAILED` likewise uses the explicit request value or the current
+  default during recovery; it does not represent configuration recovered from
+  before the crash.
 - `finished_at_ms` is the time when the worker writes the final run result. It
   is required for all `cmd.run.result` messages.
 - `started_at_ms` appears only after the command process actually starts.
-- `exit_code` appears only when `status="SUCCESS"` or `status="FAILED"`.
+- `exit_code` is the shell's exit code and appears only when `status="SUCCESS"`
+  or `status="FAILED"`.
 - `error_message` is required when `status="REJECTED"`,
   `status="START_FAILED"`, or `status="RECOVERY_FAILED"`.
 - When `status="REJECTED"`, the worker does not start the command and writes
@@ -203,6 +219,12 @@ Rules:
 stdout and stderr use the same structure. `file` and `bytes` are required.
 Whether `content` appears is determined by that stream's own `bytes`. When
 `content` appears, `content_encoding` must also appear.
+
+After opening an output file, the worker obtains its initial size through the
+same file handle. Short output reads at most that range: later appended bytes
+are excluded, and a file that shrinks during the read contributes only the bytes
+actually read. Long output records only the initial size. "Full content" therefore
+means the content within this read's range, not a promise that the file cannot change later.
 
 Short output example, `bytes <= 1024`:
 
@@ -238,9 +260,10 @@ Empty output example:
 Rules:
 
 - `file` is a path relative to `output_dir`; it does not include `output_dir`.
-- `bytes` is the byte count of that output file.
-- `content` is the full content for short output. Long output must not include
-  `content`.
+- For short output, `bytes` is the number of bytes actually read; for long output,
+  it is the file size observed at read start.
+- `content` is the full short output within this read's range. Long output must
+  not include `content`.
 - `content_encoding` appears only when `content` appears. It is either `utf-8`
   or `base64`.
 - If output bytes can be decoded as UTF-8, `content_encoding="utf-8"` and
@@ -260,8 +283,8 @@ Rules:
 
 | Status | Meaning |
 | --- | --- |
-| `SUCCESS` | Process exit code is 0. |
-| `FAILED` | Process exit code is non-zero. |
+| `SUCCESS` | No worker timeout or kill-request termination; the shell exit code is 0. |
+| `FAILED` | No worker timeout or kill-request termination; the shell exit code is non-zero. |
 | `TIMEOUT` | Worker killed the process due to timeout, or found before startup that the request had already expired. |
 | `KILLED` | Worker killed the process due to a kill request, or removed a not-yet-started task from the pending queue. |
 | `START_FAILED` | Preparation failed before process startup or the process could not start, including output file create/open failure, working directory enter failure, or shell startup failure. |
@@ -320,23 +343,27 @@ Rules:
 
 | Status | Meaning |
 | --- | --- |
-| `KILL_SENT` | Target task is still running and the worker sent a kill signal. |
+| `KILL_SENT` | Target shell is still running and the worker sent a kill signal to the task's process group. |
 | `REMOVED_PENDING` | Target task had not started and the worker removed it from the pending queue. |
-| `ALREADY_FINISHED` | Target task had already finished and the worker did not send a kill signal; if its run result had not been written, the worker first writes the final run result. |
+| `ALREADY_FINISHED` | Target already has a final run result, or its shell has exited and group cleanup and reaping are complete; in the latter case, the worker first writes the final run result. |
 | `NOT_FOUND` | Worker did not find the target task. |
 | `REJECTED` | Kill request payload is invalid or exceeds protocol/configuration limits; the worker did not send a kill signal. |
 
-When the target task is still running, the worker writes
-`cmd.kill.result(status=KILL_SENT)`, then the target task writes
-`cmd.run.result(status=KILLED)`. When the target task has not started and is
-still in the pending queue, the worker writes
-`cmd.kill.result(status=REMOVED_PENDING)` and also writes
-`cmd.run.result(status=KILLED)` for the target run request. If the worker handles
-a kill request and finds that the target process has already exited but its
-completion event has not been processed, it must first write
-`cmd.run.result(status=SUCCESS)` or `cmd.run.result(status=FAILED)` according to
-the target process exit code, then write
-`cmd.kill.result(status=ALREADY_FINISHED)`.
+When the target shell is still running, the worker writes
+`cmd.kill.result(status=KILL_SENT)`. If this kill first terminates the task,
+the final run result is `KILLED`; if a timeout had already triggered, it preserves
+`TIMEOUT`. When the target task has not started and is
+still in the pending queue, the worker first confirms
+`cmd.run.result(status=KILLED)`, then writes
+`cmd.kill.result(status=REMOVED_PENDING)`. If the worker crashes between these
+results, the run request remains closed after restart and the unfinished kill
+request may return `ALREADY_FINISHED`.
+If the target shell has exited but task cleanup is unfinished, the worker first
+completes group cleanup and shell reaping under
+[Task Process Lifecycle](CONFIGURATION.md#task-process-lifecycle), then writes the
+run result before `ALREADY_FINISHED`. The run result preserves an established
+`TIMEOUT`/`KILLED` reason. Otherwise the shell exit code selects `SUCCESS`/`FAILED`;
+cleanup of remaining group members does not change it to `KILLED`.
 
 ## 8. `cmd.output.read.request`
 
@@ -382,25 +409,6 @@ Rules:
   OpenEvent top-level message `seq`.
 
 ## 9. `cmd.output.read.result`
-
-The worker writes content back for a partial read request:
-
-```json
-{
-  "kind": "cmd.output.read.result",
-  "prev_seq": 12347,
-  "target_seq": 12345,
-  "ts_ms": 1710000002010,
-  "status": "SUCCESS",
-  "stream": "stdout",
-  "offset": 0,
-  "nbytes": 1024,
-  "bytes": 128,
-  "eof": false,
-  "content_encoding": "utf-8",
-  "content": "..."
-}
-```
 
 Rules:
 
@@ -496,10 +504,3 @@ Result when the target file does not exist:
 - `cmd.v1` does not support old-worker compatibility for new fields. When
   protocol fields change, documentation, SDK, and worker are updated together.
 - Breaking changes must use a new protocol, such as `cmd.v2`.
-
-## 11. Confirmed Protocol Decisions
-
-- Kill requests and output partial-read requests use `target_seq` as the fixed
-  target task field.
-- `target_seq` is the OpenEvent seq of the target `cmd.run.request`; it avoids
-  confusion with OpenEvent top-level message `seq`.

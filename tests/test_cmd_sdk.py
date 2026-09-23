@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
+import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from openevent.cmd_sdk import (
     CmdOutput,
@@ -11,8 +15,11 @@ from openevent.cmd_sdk import (
     CmdSDKError,
     dumps_payload,
     loads_payload,
+    parse_message,
 )
+from openevent.cmd_sdk import codec
 from openevent.cmd_sdk.codec import output_read_request_input_to_dict, output_read_result_input_to_dict, run_request_input_to_dict, run_result_input_to_dict
+from openevent.cmd_sdk.model import MAX_TIMEOUT_MS
 
 
 class CmdSDKTest(unittest.TestCase):
@@ -36,6 +43,22 @@ class CmdSDKTest(unittest.TestCase):
     def test_relative_workdir_is_rejected(self) -> None:
         with self.assertRaises(CmdSDKError):
             dumps_payload(run_request_input_to_dict(CmdRunRequestInput(command="pwd", workdir="relative", ts_ms=1)))
+
+    def test_run_timeout_accepts_both_boundaries(self) -> None:
+        for timeout_ms in (1, MAX_TIMEOUT_MS):
+            for data in _timeout_payloads(timeout_ms):
+                with self.subTest(kind=data["kind"], timeout_ms=timeout_ms):
+                    parsed = loads_payload(dumps_payload(data))
+                    self.assertEqual(parsed["timeout_ms"], timeout_ms)
+
+    def test_run_timeout_rejects_out_of_range_and_non_integer_values(self) -> None:
+        for timeout_ms in (-1, 0, MAX_TIMEOUT_MS + 1, 10**400, True, 1.5):
+            for data in _timeout_payloads(timeout_ms):
+                with self.subTest(kind=data["kind"], timeout_ms=timeout_ms):
+                    with self.assertRaises(CmdSDKError):
+                        dumps_payload(data)
+                    with self.assertRaises(CmdSDKError):
+                        loads_payload(json.dumps(data).encode("utf-8"))
 
     def test_output_read_request_round_trip(self) -> None:
         payload = dumps_payload(
@@ -118,6 +141,37 @@ class CmdSDKTest(unittest.TestCase):
     def test_request_id_is_rejected_as_an_unknown_field(self) -> None:
         with self.assertRaises(CmdSDKError):
             loads_payload(b'{"kind":"cmd.run.request","request_id":"old","ts_ms":1,"command":"true"}')
+
+    def test_parse_message_validates_binary_output_once(self) -> None:
+        raw = b"\x00\xff\x80" * 2048
+        result = CmdOutputReadResultInput(
+            prev_seq=10, target_seq=9, stream="stdout", offset=0, nbytes=len(raw),
+            status="SUCCESS", bytes=len(raw), eof=True, content_encoding="base64",
+            content=base64.b64encode(raw).decode("ascii"), ts_ms=123,
+        )
+        message = SimpleNamespace(
+            seq=11, channel_id=2001, principal=30001, recipients=[1001],
+            payload=dumps_payload(output_read_result_input_to_dict(result)),
+        )
+        with patch.object(codec, "validate_payload_dict", wraps=codec.validate_payload_dict) as validate:
+            parsed = parse_message(message)
+        validate.assert_called_once()
+        self.assertEqual((parsed.seq, parsed.channel_id, parsed.principal, parsed.recipients),
+                         (11, 2001, 30001, (1001,)))
+        self.assertEqual(parsed.payload.content_encoding, "base64")
+        self.assertEqual(parsed.payload.bytes, len(raw))
+        self.assertEqual(base64.b64decode(parsed.payload.content), raw)
+
+
+def _timeout_payloads(timeout_ms):
+    return (
+        run_request_input_to_dict(CmdRunRequestInput(command="true", timeout_ms=timeout_ms, ts_ms=1)),
+        run_result_input_to_dict(CmdRunResultInput(
+            prev_seq=1, status="TIMEOUT", timeout_ms=timeout_ms, finished_at_ms=2, ts_ms=2,
+            stdout=CmdOutput(file="1/1.stdout", bytes=0, content_encoding="utf-8", content=""),
+            stderr=CmdOutput(file="1/1.stderr", bytes=0, content_encoding="utf-8", content=""),
+        )),
+    )
 
 
 if __name__ == "__main__":

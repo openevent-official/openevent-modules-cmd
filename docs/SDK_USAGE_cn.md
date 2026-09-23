@@ -77,22 +77,25 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 
 ## 集成说明
 
-- 发布辅助函数统一使用 OpenEvent `PublishAutoSeq`。
-- `cmd.run.request`、`cmd.kill.request` 和 `cmd.output.read.request` 发布时 `recipients` 为空。
-- cmd worker 使用 OpenEvent `Fetch(only_my_recipient=false, channels=channel_ids)`；否则会漏掉
-  `recipients` 为空的请求消息或处理配置范围外的 channel。
-- `CmdRunRequestInput.workdir` 如果传入，必须是绝对路径。
-- `cmd.run.accepted` 和 result 发布辅助函数面向 `cmd-worker`，调用方需要显式传入 recipients。
-- `cmd.run.result` 的 stdout/stderr 对象在 `bytes <= 1024` 时包含 `content`，在
-  `bytes > 1024` 时只包含文件元信息。
-- `content` 出现时必须同时检查 `content_encoding`；值为 `utf-8` 时内容是 UTF-8 字符串，
-  值为 `base64` 时内容是原始字节的 base64 字符串。
-- `cmd.output.read.result.content` 总是写入本次局部读取的内容；目标文件不存在时为空字符串，
-  `content_encoding` 为 `utf-8`。
-- 同一 channel 内成员都可以发布 `cmd.output.read.request` 读取该 channel 内的命令输出。
-- SDK 校验 `cmd.output.read.request.nbytes` 时，只检查它是正整数；实际返回大小由 worker 根据
-  OpenEvent payload 上限控制。
-- SDK 需要能解析各类 result 的 `error_message`；`REJECTED`、`START_FAILED`、`READ_FAILED` 和
-  `RECOVERY_FAILED` 等状态会使用该字段说明原因。
-- SDK 或 worker 做重复确认/result 判断时，以同一 channel 内的 `kind + prev_seq` 为准。
-- SDK 负责校验 payload 结构；channel 归属、命令安全和权限边界由部署负责。
+- 发布方法返回消息的整数 seq，使用 OpenEvent `PublishAutoSeq`；请求方法自动使用空 recipients。
+- 所有发布方法支持可选关键字参数 `uuid`。省略时从已安装的 OpenEvent SDK 分配 UUID；指定时使用传入值。
+  本辅助层不自动重试。UUID 复用和消息一致性规则以 OpenEvent SDK API 为准。
+- `parse_message(message)` 返回 `ParsedMessage`，包含顶层 seq、channel_id、principal、recipients 和已校验的 payload 模型。
+  非法 payload 抛出 `CmdSDKError`，可读取其 `code` 和 `message`；OpenEvent RPC 错误保持原异常。
+- 输出内容、编码、状态和字段规则统一见[协议](CMD_PROTOCOL_cn.md)，读取内容时应同时读取 `content_encoding`。
+- worker 使用 `Fetch(only_my_recipient=false, channels=channel_ids)` 获取配置通道的请求和结果。
+
+## Worker 发布接口
+
+以下方法面向 worker。`request_principal` 是原请求的发送方，辅助函数自动写成
+`recipients=[request_principal]`，没有名为 `recipients` 的参数。
+
+```text
+client.publish_run_accepted(principal, token, channel_id, request_principal, prev_seq, *, uuid=None)
+client.publish_run_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+client.publish_kill_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+client.publish_output_read_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
+```
+
+上面列出的是方法签名。三个 `result_payload` 分别使用 `CmdRunResultInput`、`CmdKillResultInput`、
+`CmdOutputReadResultInput`；发布函数与请求函数一样返回整数 seq。

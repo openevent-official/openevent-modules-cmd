@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from openevent.cmd_sdk.codec import dumps_payload, output_read_result_input_to_dict
 from openevent.cmd_sdk.model import KIND_OUTPUT_READ_REQUEST, CmdOutputReadRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.worker import CmdWorker, InvalidRequestEvent, OutputReadEvent
@@ -18,8 +20,8 @@ class FakePublisher:
     def __init__(self) -> None:
         self.output_read_result = None
 
-    def publish_output_read_result(self, channel_id, request_principal, result, check_from_seq):
-        del channel_id, request_principal, check_from_seq
+    def publish_output_read_result(self, channel_id, request_principal, result):
+        del channel_id, request_principal
         self.output_read_result = result
         return SimpleNamespace(seq=999)
 
@@ -48,11 +50,6 @@ class WorkerOutputReadTest(unittest.TestCase):
         self.assertEqual(stopped, [True])
 
     def test_wait_task_reports_internal_error_to_main_thread(self) -> None:
-        class BrokenProcess:
-            def wait(self, timeout=None):
-                del timeout
-                raise RuntimeError("wait failed")
-
         worker = CmdWorker(
             CmdWorkerConfig(
                 protocol="cmd.v1",
@@ -64,17 +61,20 @@ class WorkerOutputReadTest(unittest.TestCase):
             ),
             FakeClient(),
         )
-        task = SimpleNamespace(deadline_ms=10**15, process=BrokenProcess(), channel_id=2001, seq=1)
-        worker._wait_task(task)
+        task = SimpleNamespace(deadline_ms=10**15, channel_id=2001, seq=1)
+        failure = RuntimeError("wait failed")
+        with patch.object(worker.runner, "wait", side_effect=failure):
+            worker._wait_task(task)
         with self.assertRaisesRegex(RuntimeError, "failed to wait for command") as raised:
             worker._drain_completions()
-        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertIs(raised.exception.__cause__, failure)
 
-    def test_output_read_reduces_bytes_to_fit_payload_limit(self) -> None:
+    def test_output_read_bounds_initial_read_and_trims_without_reopening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             channel_dir = Path(tmp) / "2001"
             channel_dir.mkdir()
-            (channel_dir / "123.stdout").write_bytes(b"x" * 4096)
+            output_path = channel_dir / "123.stdout"
+            output_path.write_bytes(b"\x00" * (1024 * 1024))
             config = CmdWorkerConfig(
                 protocol="cmd.v1",
                 open_event=OpenEventConfig(addr="127.0.0.1:9527", max_payload_bytes=512),
@@ -88,11 +88,51 @@ class WorkerOutputReadTest(unittest.TestCase):
                 seq=124,
                 channel_id=2001,
                 principal=1001,
-                request=CmdOutputReadRequest(target_seq=123, stream="stdout", offset=0, nbytes=4096, ts_ms=1),
+                request=CmdOutputReadRequest(target_seq=123, stream="stdout", offset=0, nbytes=1024 * 1024, ts_ms=1),
             )
-            result = worker._build_output_read_result(event)
+            read_sizes = []
+            opened = []
+            original_open = Path.open
+
+            class TrackingReader:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.handle.close()
+
+                def seek(self, offset):
+                    return self.handle.seek(offset)
+
+                def fileno(self):
+                    return self.handle.fileno()
+
+                def read(self, size=-1):
+                    read_sizes.append(size)
+                    return self.handle.read(size)
+
+            def tracked_open(path, *args, **kwargs):
+                handle = original_open(path, *args, **kwargs)
+                if path == output_path:
+                    opened.append(path)
+                    return TrackingReader(handle)
+                return handle
+
+            with patch.object(Path, "open", tracked_open):
+                result = worker._build_output_read_result(event)
+
             self.assertEqual(result.status, "SUCCESS")
-            self.assertLess(result.bytes, 4096)
+            self.assertGreater(result.bytes, 0)
+            self.assertEqual(result.content, "\x00" * result.bytes)
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(len(read_sizes), 1)
+            self.assertGreater(read_sizes[0], 0)
+            self.assertLessEqual(read_sizes[0], config.open_event.max_payload_bytes)
+            self.assertLessEqual(len(dumps_payload(output_read_result_input_to_dict(result))), config.open_event.max_payload_bytes)
+            self.assertEqual(result.nbytes, 1024 * 1024)
             self.assertFalse(result.eof)
 
     def test_invalid_output_read_does_not_echo_bool_int_fields(self) -> None:

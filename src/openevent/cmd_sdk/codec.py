@@ -17,6 +17,7 @@ from .model import (
     KIND_RUN_REQUEST,
     KIND_RUN_RESULT,
     KILL_STATUSES,
+    MAX_TIMEOUT_MS,
     OUTPUT_READ_STATUSES,
     OUTPUT_STREAMS,
     RUN_STATUSES,
@@ -171,7 +172,7 @@ def output_to_dict(output: CmdOutput) -> dict[str, Any]:
 
 
 def dict_to_model(data: dict[str, Any]):
-    validate_payload_dict(data)
+    """Construct a model from a dictionary validated by loads_payload."""
     kind = data["kind"]
     if kind == KIND_RUN_REQUEST:
         return CmdRunRequest(
@@ -244,7 +245,7 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
             if not workdir.startswith("/"):
                 raise CmdSDKError("INVALID_WORKDIR", "workdir must be absolute")
         if "timeout_ms" in data:
-            _require_positive_int(data, "timeout_ms")
+            _require_timeout_ms(data)
     elif kind == KIND_RUN_ACCEPTED:
         _reject_unknown(data, {"kind", "ts_ms", "prev_seq"})
         _require_positive_int(data, "prev_seq")
@@ -269,7 +270,7 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         status = _require_enum(data, "status", RUN_STATUSES)
         _require_non_negative_int(data, "finished_at_ms")
         if "timeout_ms" in data:
-            _require_positive_int(data, "timeout_ms")
+            _require_timeout_ms(data)
         elif status != "REJECTED":
             raise CmdSDKError("MISSING_TIMEOUT", "timeout_ms is required unless status is REJECTED")
         if "started_at_ms" in data:
@@ -415,6 +416,13 @@ def _require_positive_int(data: dict[str, Any], key: str) -> int:
     value = data.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise CmdSDKError("INVALID_FIELD", f"{key} must be a positive integer")
+    return value
+
+
+def _require_timeout_ms(data: dict[str, Any]) -> int:
+    value = _require_positive_int(data, "timeout_ms")
+    if value > MAX_TIMEOUT_MS:
+        raise CmdSDKError("INVALID_FIELD", f"timeout_ms must be in 1..{MAX_TIMEOUT_MS}")
     return value
 
 

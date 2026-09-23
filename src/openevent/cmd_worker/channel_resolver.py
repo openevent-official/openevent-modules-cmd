@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 
-from openevent.sdk.proto import openevent_pb2
 
 
 class ChannelValidationError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class ChannelInfo:
-    channel_id: int
 
 
 class ChannelResolver:
@@ -24,6 +17,8 @@ class ChannelResolver:
         self._validated: set[int] = set()
 
     def validate_startup(self) -> None:
+        from openevent.sdk.proto import openevent_pb2
+
         for channel_id in sorted(self.channel_ids):
             response = self.openevent_client.get_channel(self.principal, self.token, channel_id)
             channel = response.channel

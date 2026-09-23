@@ -3,25 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .codec import (
-    dict_to_model,
-    dumps_payload,
-    kill_request_input_to_dict,
-    kill_result_input_to_dict,
-    loads_payload,
-    output_read_request_input_to_dict,
-    output_read_result_input_to_dict,
-    run_accepted_to_dict,
-    run_request_input_to_dict,
-    run_result_input_to_dict,
+    dict_to_model, dumps_payload, loads_payload,
+    kill_request_input_to_dict, kill_result_input_to_dict,
+    output_read_request_input_to_dict, output_read_result_input_to_dict,
+    run_accepted_to_dict, run_request_input_to_dict, run_result_input_to_dict,
 )
 from .model import (
-    CmdKillRequestInput,
-    CmdKillResultInput,
-    CmdOutputReadRequestInput,
-    CmdOutputReadResultInput,
-    CmdRunRequestInput,
-    CmdRunResultInput,
-    ParsedMessage,
+    CmdKillRequestInput, CmdKillResultInput, CmdOutputReadRequestInput,
+    CmdOutputReadResultInput, CmdRunRequestInput, CmdRunResultInput, ParsedMessage,
 )
 
 
@@ -29,82 +18,36 @@ from .model import (
 class CmdProtocolClient:
     openevent_client: object
 
-    def publish_run_request(self, principal: int, token: str, channel_id: int, req: CmdRunRequestInput) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[],
-            payload=dumps_payload(run_request_input_to_dict(req)),
-        )
-        return int(result.seq)
+    def _publish(self, principal, token, channel_id, data, recipients, uuid):
+        payload = dumps_payload(data)
+        if uuid is None:
+            uuid = self.openevent_client.get_uuid()
+        return int(self.openevent_client.publish_auto_seq(
+            principal=principal, token=token, channel_id=channel_id,
+            recipients=recipients, payload=payload, uuid=uuid,
+        ).seq)
 
-    def publish_kill_request(self, principal: int, token: str, channel_id: int, req: CmdKillRequestInput) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[],
-            payload=dumps_payload(kill_request_input_to_dict(req)),
-        )
-        return int(result.seq)
+    def publish_run_request(self, principal: int, token: str, channel_id: int, req: CmdRunRequestInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, run_request_input_to_dict(req), [], uuid)
 
-    def publish_output_read_request(self, principal: int, token: str, channel_id: int, req: CmdOutputReadRequestInput) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[],
-            payload=dumps_payload(output_read_request_input_to_dict(req)),
-        )
-        return int(result.seq)
+    def publish_kill_request(self, principal: int, token: str, channel_id: int, req: CmdKillRequestInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, kill_request_input_to_dict(req), [], uuid)
 
-    def publish_run_accepted(self, principal: int, token: str, channel_id: int, request_principal: int, prev_seq: int) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[request_principal],
-            payload=dumps_payload(run_accepted_to_dict(prev_seq)),
-        )
-        return int(result.seq)
+    def publish_output_read_request(self, principal: int, token: str, channel_id: int, req: CmdOutputReadRequestInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, output_read_request_input_to_dict(req), [], uuid)
 
-    def publish_run_result(self, principal: int, token: str, channel_id: int, request_principal: int, result_payload: CmdRunResultInput) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[request_principal],
-            payload=dumps_payload(run_result_input_to_dict(result_payload)),
-        )
-        return int(result.seq)
+    def publish_run_accepted(self, principal: int, token: str, channel_id: int, request_principal: int, prev_seq: int, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, run_accepted_to_dict(prev_seq), [request_principal], uuid)
 
-    def publish_kill_result(self, principal: int, token: str, channel_id: int, request_principal: int, result_payload: CmdKillResultInput) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[request_principal],
-            payload=dumps_payload(kill_result_input_to_dict(result_payload)),
-        )
-        return int(result.seq)
+    def publish_run_result(self, principal: int, token: str, channel_id: int, request_principal: int, result_payload: CmdRunResultInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, run_result_input_to_dict(result_payload), [request_principal], uuid)
 
-    def publish_output_read_result(
-        self,
-        principal: int,
-        token: str,
-        channel_id: int,
-        request_principal: int,
-        result_payload: CmdOutputReadResultInput,
-    ) -> int:
-        result = self.openevent_client.publish_auto_seq(
-            principal=principal,
-            token=token,
-            channel_id=channel_id,
-            recipients=[request_principal],
-            payload=dumps_payload(output_read_result_input_to_dict(result_payload)),
-        )
-        return int(result.seq)
+    def publish_kill_result(self, principal: int, token: str, channel_id: int, request_principal: int, result_payload: CmdKillResultInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, kill_result_input_to_dict(result_payload), [request_principal], uuid)
+
+    def publish_output_read_result(self, principal: int, token: str, channel_id: int, request_principal: int, result_payload: CmdOutputReadResultInput, *, uuid: int | None = None) -> int:
+        return self._publish(principal, token, channel_id, output_read_result_input_to_dict(result_payload), [request_principal], uuid)
+
 
 def create_client(openevent_client: object) -> CmdProtocolClient:
     return CmdProtocolClient(openevent_client=openevent_client)
@@ -113,9 +56,7 @@ def create_client(openevent_client: object) -> CmdProtocolClient:
 def parse_message(message) -> ParsedMessage:
     payload = dict_to_model(loads_payload(message.payload))
     return ParsedMessage(
-        seq=int(message.seq),
-        channel_id=int(message.channel_id),
+        seq=int(message.seq), channel_id=int(message.channel_id),
         principal=int(message.principal),
-        recipients=tuple(int(value) for value in message.recipients),
-        payload=payload,
+        recipients=tuple(int(value) for value in message.recipients), payload=payload,
     )

@@ -1,27 +1,21 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 
-from openevent.cmd_sdk import parse_message
-from openevent.cmd_sdk.client import CmdProtocolClient
-from openevent.cmd_sdk.errors import CmdSDKError
-from openevent.cmd_sdk.model import (
-    KIND_KILL_RESULT,
-    KIND_OUTPUT_READ_RESULT,
-    KIND_RUN_ACCEPTED,
-    KIND_RUN_RESULT,
-    CmdKillResult,
-    CmdKillResultInput,
-    CmdOutputReadResult,
-    CmdOutputReadResultInput,
-    CmdRunAccepted,
-    CmdRunResult,
-    CmdRunResultInput,
+import grpc
+
+from openevent.cmd_sdk.codec import (
+    dumps_payload, kill_result_input_to_dict, output_read_result_input_to_dict,
+    run_accepted_to_dict, run_result_input_to_dict,
 )
 
 LOG = logging.getLogger(__name__)
+_DEFINITIVE_FAILURES = frozenset({
+    grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED,
+    grpc.StatusCode.NOT_FOUND, grpc.StatusCode.INVALID_ARGUMENT,
+    grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.ABORTED,
+})
 
 
 class PublishFatal(RuntimeError):
@@ -30,137 +24,48 @@ class PublishFatal(RuntimeError):
 
 @dataclass(frozen=True)
 class Published:
-    seq: int | None
+    seq: int
 
 
 class ReliablePublisher:
-    def __init__(
-        self,
-        protocol_client: CmdProtocolClient,
-        openevent_client,
-        principal: int,
-        token: str,
-        channel_ids: tuple[int, ...],
-        fetch_error_max_retries: int,
-        fetch_error_retry_sleep_ms: int,
-    ):
-        self.protocol_client = protocol_client
-        self.openevent_client = openevent_client
+    def __init__(self, client, principal: int, token: str, max_payload_bytes: int):
+        self.client = client
         self.principal = principal
         self.token = token
-        self.channel_ids = channel_ids
-        self.fetch_error_max_retries = fetch_error_max_retries
-        self.fetch_error_retry_sleep_ms = fetch_error_retry_sleep_ms
+        self.max_payload_bytes = max_payload_bytes
 
-    def publish_run_accepted(self, channel_id: int, request_principal: int, prev_seq: int, check_from_seq: int) -> Published:
-        return self._publish_with_check(
-            channel_id,
-            KIND_RUN_ACCEPTED,
-            prev_seq,
-            check_from_seq,
-            lambda: self.protocol_client.publish_run_accepted(self.principal, self.token, channel_id, request_principal, prev_seq),
-        )
+    def publish_run_accepted(self, channel_id, request_principal, prev_seq):
+        return self._publish(channel_id, request_principal, run_accepted_to_dict(prev_seq))
 
-    def publish_run_result(self, channel_id: int, request_principal: int, result: CmdRunResultInput, check_from_seq: int) -> Published:
-        return self._publish_with_check(
-            channel_id,
-            KIND_RUN_RESULT,
-            result.prev_seq,
-            check_from_seq,
-            lambda: self.protocol_client.publish_run_result(self.principal, self.token, channel_id, request_principal, result),
-        )
+    def publish_run_result(self, channel_id, request_principal, result):
+        return self._publish(channel_id, request_principal, run_result_input_to_dict(result))
 
-    def publish_kill_result(self, channel_id: int, request_principal: int, result: CmdKillResultInput, check_from_seq: int) -> Published:
-        return self._publish_with_check(
-            channel_id,
-            KIND_KILL_RESULT,
-            result.prev_seq,
-            check_from_seq,
-            lambda: self.protocol_client.publish_kill_result(self.principal, self.token, channel_id, request_principal, result),
-        )
+    def publish_kill_result(self, channel_id, request_principal, result):
+        return self._publish(channel_id, request_principal, kill_result_input_to_dict(result))
 
-    def publish_output_read_result(
-        self,
-        channel_id: int,
-        request_principal: int,
-        result: CmdOutputReadResultInput,
-        check_from_seq: int,
-    ) -> Published:
-        return self._publish_with_check(
-            channel_id,
-            KIND_OUTPUT_READ_RESULT,
-            result.prev_seq,
-            check_from_seq,
-            lambda: self.protocol_client.publish_output_read_result(self.principal, self.token, channel_id, request_principal, result),
-        )
+    def publish_output_read_result(self, channel_id, request_principal, result):
+        return self._publish(channel_id, request_principal, output_read_result_input_to_dict(result))
 
-    def _publish_with_check(self, channel_id: int, kind: str, prev_seq: int, check_from_seq: int, publish_call) -> Published:
-        try:
-            return Published(seq=publish_call())
-        except Exception as exc:  # pragma: no cover - exercised with integration tests
-            LOG.warning("publish returned error; checking whether message was committed", extra={"kind": kind, "prev_seq": prev_seq, "error": repr(exc)})
-        existing = self._find_existing(channel_id, kind, prev_seq, max(1, check_from_seq))
-        if existing is not None:
-            return Published(seq=existing)
-        try:
-            return Published(seq=publish_call())
-        except Exception as exc:
-            raise PublishFatal(f"failed to publish {kind} for prev_seq={prev_seq}") from exc
-
-    def _find_existing(self, channel_id: int, kind: str, prev_seq: int, from_seq: int) -> int | None:
-        current = max(1, from_seq)
-        scan_last_seq: int | None = None
-        found: int | None = None
-        while True:
-            response = self._fetch_with_retries(current)
-            if scan_last_seq is None:
-                scan_last_seq = int(response.last_seq)
-            for message in response.messages:
-                if int(message.seq) > scan_last_seq:
-                    continue
-                if int(message.channel_id) != channel_id:
-                    continue
-                try:
-                    parsed = parse_message(message)
-                except CmdSDKError:
-                    continue
-                payload = parsed.payload
-                if _matches_kind_prev(payload, kind, prev_seq):
-                    if found is not None and found != parsed.seq:
-                        raise PublishFatal(f"duplicate {kind} for prev_seq={prev_seq}")
-                    found = parsed.seq
-            next_seq = min(int(response.next_seq), scan_last_seq + 1)
-            if next_seq > scan_last_seq:
-                return found
-            if next_seq <= current:
-                raise PublishFatal("Fetch did not advance while checking published message")
-            current = next_seq
-
-    def _fetch_with_retries(self, from_seq: int):
-        attempts = 0
-        while True:
+    def _publish(self, channel_id, request_principal, data):
+        # Freeze the timestamp, encoded payload and UUID for both attempts.
+        payload = dumps_payload(data)
+        if len(payload) > self.max_payload_bytes:
+            raise PublishFatal(f"{data['kind']} payload exceeds max_payload_bytes")
+        uuid = self.client.get_uuid()
+        for attempt in range(2):
             try:
-                kwargs = {
-                    "from_seq": from_seq,
-                    "limit": 1000,
-                    "only_my_recipient": False,
-                    "channels": self.channel_ids,
-                }
-                return self.openevent_client.fetch(self.principal, self.token, **kwargs)
-            except Exception:
-                attempts += 1
-                if attempts > self.fetch_error_max_retries:
-                    raise
-                time.sleep(self.fetch_error_retry_sleep_ms / 1000)
-
-
-def _matches_kind_prev(payload, kind: str, prev_seq: int) -> bool:
-    if kind == KIND_RUN_ACCEPTED and isinstance(payload, CmdRunAccepted):
-        return payload.prev_seq == prev_seq
-    if kind == KIND_RUN_RESULT and isinstance(payload, CmdRunResult):
-        return payload.prev_seq == prev_seq
-    if kind == KIND_KILL_RESULT and isinstance(payload, CmdKillResult):
-        return payload.prev_seq == prev_seq
-    if kind == KIND_OUTPUT_READ_RESULT and isinstance(payload, CmdOutputReadResult):
-        return payload.prev_seq == prev_seq
-    return False
+                response = self.client.publish_auto_seq(
+                    principal=self.principal, token=self.token, channel_id=channel_id,
+                    recipients=[request_principal], payload=payload, uuid=uuid,
+                )
+                return Published(seq=int(response.seq))
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.ALREADY_EXISTS:
+                    try:
+                        return Published(seq=int(self.client.get_seq_by_uuid(uuid)))
+                    except grpc.RpcError as lookup_error:
+                        raise PublishFatal(f"failed to resolve committed {data['kind']} UUID {uuid}") from lookup_error
+                if attempt or exc.code() in _DEFINITIVE_FAILURES:
+                    raise PublishFatal(f"failed to publish {data['kind']} for prev_seq={data['prev_seq']}") from exc
+                LOG.warning("publish outcome unknown; retrying the same UUID", extra={"uuid": uuid, "kind": data['kind']})
+        raise AssertionError("publish attempts exhausted")

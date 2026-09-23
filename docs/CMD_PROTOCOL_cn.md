@@ -56,6 +56,9 @@ cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的
 非法 payload 但能识别出对应请求类型时，worker 必须写对应 result，并通过
 `status="REJECTED"` 表示拒绝；如果 payload 损坏到无法识别请求类型，worker 只能记录错误并忽略。
 所有 `status="REJECTED"` 的 result 都必须写 `error_message`，用于说明拒绝原因。
+worker 写出的错误说明最多占 512 个 UTF-8 字节，必要时在完整字符边界截短。
+worker 支持的最小部署 payload 上限见[配置文档](CONFIGURATION_cn.md#字段)；所有 accepted/result
+在发布前检查最终编码大小。局部读取按第 8、9 节缩小返回量；其他无法容纳的结果导致 worker 报错退出。
 
 ## 3. `cmd.run.request`
 
@@ -75,13 +78,14 @@ cmd 协议涉及命令超时计算时，必须使用对应 `cmd.run.request` 的
 - OpenEvent `recipients` 必须为空。
 - `command` 必填，是非空字符串，表示要执行的完整 Linux 命令行。
 - worker 使用 Linux shell 执行 `command`；默认等价于 `/bin/sh -c <command>`。
+  shell 退出后的组清理、回收顺序及管理范围见[任务进程生命周期](CONFIGURATION_cn.md#任务进程生命周期)。
 - `workdir` 可选，是非空字符串，表示命令执行工作目录；缺失时使用 worker 当前工作目录。
 - `workdir` 如果出现，必须是绝对路径。
 - `workdir` 是绝对路径但不存在、不是目录、无权限进入，或导致 shell 进程无法启动时，payload 本身不视为非法；
   worker 写 `cmd.run.result(status=START_FAILED)` 和 `error_message`。
-- `timeout_ms` 可选，必须是正整数；缺失时 worker 使用配置里的默认超时。
-- `timeout_ms` 缺失时始终使用 worker 处理该请求时的当前默认超时配置；启动恢复处理历史未 accepted
-  run request 时也是如此。
+- `timeout_ms` 可选，必须是 `1..18446744073709551615`（`2**64-1`）范围内的整数。
+  缺失时使用 worker 处理该请求时的当前默认超时；启动恢复也使用当前配置，包括补写 `RECOVERY_FAILED`。
+  恢复行为见[运行说明](CONFIGURATION_cn.md#恢复与退出)。
 - 超时截止时间按该 `cmd.run.request` 消息的 OpenEvent 顶层 `EventMessage.ts_ms` 加 `timeout_ms` 计算；
   缺失 `timeout_ms` 时使用配置里的默认超时。payload 内的 `ts_ms` 不作为超时起点。
 - `cmd.run.request` 不支持独立的 `env` 或 `stdin` 字段。
@@ -107,6 +111,8 @@ worker 准备启动合法且未超时的 `cmd.run.request` 时，必须在启动
 - OpenEvent `recipients` 是原始 `cmd.run.request` 的发送方 principal。
 - `prev_seq` 必填，必须等于对应 run request 的 OpenEvent seq。
 - `cmd.run.accepted` 必须在启动命令进程前写入。
+- accepted 确认写入后，worker 再次检查超时；如果发布期间截止时间已到，不启动进程，写
+  `cmd.run.result(status=TIMEOUT)`。因此 accepted 不保证命令已经启动。
 - 如果 run request 非法，worker 不写 `cmd.run.accepted`，直接写
   `cmd.run.result(status=REJECTED)`。
 - 如果 run request 在获得执行槽位前已经超时，worker 不写 `cmd.run.accepted`，直接写
@@ -143,13 +149,15 @@ stdout/stderr 小于等于 1k 时直接写内容，大于 1k 时只写文件元�
 - `stdout.file` 固定为 `<channel_id>/<prev_seq>.stdout`；`stderr.file` 固定为
   `<channel_id>/<prev_seq>.stderr`。这里的 `file` 是相对 `output_dir` 的路径。
 - `stdout` 和 `stderr` 分别独立判断输出大小，阈值为 1024 字节：
-  - `bytes <= 1024` 时必须写 `content`，内容为对应输出文件的完整内容。
+  - `bytes <= 1024` 时必须写 `content`，内容为本次读取范围内的完整内容，读取范围见下节。
   - `bytes > 1024` 时不得写 `content`，只写文件元信息。
 - 实际输出目录由 worker 配置 `output_dir` 决定。
-- `timeout_ms` 是本次运行请求使用的有效超时时间；除 `status="REJECTED"` 且无法确定有效超时外必须出现。
+- `timeout_ms` 是本次处理该运行请求采用的有效超时时间，范围为 `1..18446744073709551615`（`2**64-1`）；
+  除 `status="REJECTED"` 且无法确定有效超时外必须出现。`RECOVERY_FAILED` 同样使用请求显式值或恢复时
+  的当前默认值，不表示从崩溃前恢复出的配置。
 - `finished_at_ms` 是 worker 写出最终运行结果的时间，所有 `cmd.run.result` 都必须出现。
 - `started_at_ms` 只在命令进程实际启动后出现。
-- `exit_code` 只在 `status="SUCCESS"` 或 `status="FAILED"` 时出现。
+- `exit_code` 是 shell 的退出码，只在 `status="SUCCESS"` 或 `status="FAILED"` 时出现。
 - `error_message` 在 `status="REJECTED"`、`status="START_FAILED"` 或 `status="RECOVERY_FAILED"` 时必须出现。
 - `status="REJECTED"` 时 worker 不启动命令，stdout/stderr 写空输出对象。
 - 启动前已经超时、待执行队列中被 kill、请求非法或启动失败时，stdout/stderr 都写空输出对象。
@@ -162,6 +170,10 @@ stdout/stderr 小于等于 1k 时直接写内容，大于 1k 时只写文件元�
 
 stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是否出现由该输出流自己的
 `bytes` 决定。出现 `content` 时，必须同时写 `content_encoding`。
+
+worker 打开输出文件后通过同一文件句柄取得读取开始时的大小。短输出最多读取这个范围：
+文件随后增长时不包含新追加的字节，读取期间缩短时只包含实际读到的内容；长输出只记录读取开始时的大小。
+因此“完整内容”指本次读取范围，不承诺输出文件以后不会变化。
 
 短输出示例，`bytes <= 1024`：
 
@@ -197,8 +209,8 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 规则：
 
 - `file` 是相对 `output_dir` 的路径，不包含 `output_dir` 本身。
-- `bytes` 是该输出文件的字节数。
-- `content` 是短输出的完整内容；长输出不得写 `content`。
+- `bytes` 对短输出是本次实际读取的字节数，对长输出是读取开始时的文件大小。
+- `content` 是短输出在本次读取范围内的完整内容；长输出不得写 `content`。
 - `content_encoding` 只在 `content` 出现时出现，取值为 `utf-8` 或 `base64`。
 - 如果输出字节能按 UTF-8 解码，`content_encoding="utf-8"`，`content` 写解码后的字符串。
 - 如果输出字节不能按 UTF-8 解码，`content_encoding="base64"`，`content` 写原始字节的 base64 字符串。
@@ -211,8 +223,8 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 
 | 状态 | 含义 |
 | --- | --- |
-| `SUCCESS` | 进程退出码为 0 |
-| `FAILED` | 进程退出码非 0 |
+| `SUCCESS` | 未因 worker 超时或 kill 请求终止，shell 退出码为 0 |
+| `FAILED` | 未因 worker 超时或 kill 请求终止，shell 退出码非 0 |
 | `TIMEOUT` | worker 因超时杀掉进程，或在启动前发现请求已经超时 |
 | `KILLED` | worker 因 kill 请求杀掉进程，或从待执行队列中删除未启动任务 |
 | `START_FAILED` | 进程启动前准备失败或进程无法启动，包括输出文件无法创建或打开、工作目录无法进入、shell 无法启动 |
@@ -263,18 +275,20 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 
 | 状态 | 含义 |
 | --- | --- |
-| `KILL_SENT` | 目标任务仍在运行，worker 已发送 kill 信号 |
+| `KILL_SENT` | 目标 shell 仍在运行，worker 已向任务进程组发送 kill 信号 |
 | `REMOVED_PENDING` | 目标任务尚未启动，worker 已从待执行队列中删除 |
-| `ALREADY_FINISHED` | 目标任务已经结束，worker 未发送 kill；如果尚未写运行结果，worker 先写最终 run result |
+| `ALREADY_FINISHED` | 目标任务已有最终 run result，或 shell 已退出并完成组清理与回收；后一种情形先写最终 run result |
 | `NOT_FOUND` | worker 没有找到目标任务 |
 | `REJECTED` | kill 请求 payload 非法或超过协议/配置限制，worker 未发送 kill |
 
-目标任务仍在运行时，worker 写 `cmd.kill.result(status=KILL_SENT)`，随后目标任务写
-`cmd.run.result(status=KILLED)`。目标任务尚未启动且仍在待执行队列中时，worker 写
-`cmd.kill.result(status=REMOVED_PENDING)`，并为目标运行请求写 `cmd.run.result(status=KILLED)`。
-如果 worker 处理 kill 请求时发现目标进程已经退出但完成事件尚未处理，必须先根据目标进程退出码
-为目标运行请求写 `cmd.run.result(status=SUCCESS)` 或 `cmd.run.result(status=FAILED)`，再写
-`cmd.kill.result(status=ALREADY_FINISHED)`。
+目标 shell 仍在运行时，worker 写 `cmd.kill.result(status=KILL_SENT)`。如果这次 kill 首先终止目标，
+最终运行结果为 `KILLED`；如果超时已经先触发，则保留 `TIMEOUT`。
+目标任务尚未启动且仍在待执行队列中时，worker 先确认写入
+`cmd.run.result(status=KILLED)`，再写 `cmd.kill.result(status=REMOVED_PENDING)`。
+两条结果之间 worker 崩溃时，重启后目标运行请求保持已闭合，未完成的 kill 请求可以返回 `ALREADY_FINISHED`。
+如果处理 kill 时目标 shell 已经退出但任务尚未收尾，先按[任务生命周期](CONFIGURATION_cn.md#任务进程生命周期)
+完成组清理和 shell 回收、写运行结果，再写 `ALREADY_FINISHED`。运行结果保留已确定的 `TIMEOUT`/`KILLED` 原因；
+没有这类终止原因时，按 shell 退出码写 `SUCCESS`/`FAILED`，组内残留清理不改为 `KILLED`。
 
 ## 8. `cmd.output.read.request`
 
@@ -310,25 +324,6 @@ stdout 和 stderr 使用相同结构。`file` 和 `bytes` 必填；`content` 是
 - 字段名使用 `target_seq` 而不是 `seq`，是为了避免和 OpenEvent 顶层消息 `seq` 混淆。
 
 ## 9. `cmd.output.read.result`
-
-worker 对局部读取请求写回内容：
-
-```json
-{
-  "kind": "cmd.output.read.result",
-  "prev_seq": 12347,
-  "target_seq": 12345,
-  "ts_ms": 1710000002010,
-  "status": "SUCCESS",
-  "stream": "stdout",
-  "offset": 0,
-  "nbytes": 1024,
-  "bytes": 128,
-  "eof": false,
-  "content_encoding": "utf-8",
-  "content": "..."
-}
-```
 
 规则：
 
@@ -408,9 +403,3 @@ worker 对局部读取请求写回内容：
 
 - `cmd.v1` 不考虑旧 worker 对新字段的兼容；协议字段变化时，文档、SDK 和 worker 同步更新。
 - 破坏性变更必须使用新协议，例如 `cmd.v2`。
-
-## 11. 已确认协议决策
-
-- kill 请求和输出局部读取请求的目标任务字段固定使用 `target_seq`。
-- `target_seq` 表示目标 `cmd.run.request` 的 OpenEvent seq，用于避免和 OpenEvent 顶层消息
-  `seq` 混淆。

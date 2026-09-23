@@ -5,7 +5,7 @@ import logging
 import signal
 import sys
 
-from openevent.sdk import OpenEventClient
+from openevent.cmd_sdk.dependencies import require_sdk
 
 from .config import ConfigError, load_config
 from .worker import CmdWorker
@@ -26,28 +26,44 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
+        require_sdk()
         config = load_config(args.config)
-    except ConfigError as exc:
+    except (ConfigError, RuntimeError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    from openevent.sdk import OpenEventClient
+
     client = OpenEventClient(config.open_event.addr)
     worker = CmdWorker(config, client)
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_handlers = {value: signal.getsignal(value) for value in (signal.SIGTERM, signal.SIGINT)}
+    stop_signal = None
 
     def request_stop(signum, frame):
-        del signum, frame
-        raise _StopRequested
+        nonlocal stop_signal
+        del frame
+        if stop_signal is None:
+            stop_signal = signum
+        # stop() also marks stopping before cleanup after a program error.
+        # Further signals must not interrupt cleanup or replace that error.
+        if worker.stopping:
+            return
+        worker.stopping = True
+        if not worker.starting_command:
+            raise _StopRequested
 
-    signal.signal(signal.SIGTERM, request_stop)
+    for value in previous_handlers:
+        signal.signal(value, request_stop)
     try:
         worker.run()
     except KeyboardInterrupt:
         return 130
     except _StopRequested:
-        return 143
+        pass
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-    return 0
+        for value, handler in previous_handlers.items():
+            signal.signal(value, handler)
+        client.close()
+    return 128 + stop_signal if stop_signal is not None else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
