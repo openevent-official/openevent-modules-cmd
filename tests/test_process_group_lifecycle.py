@@ -46,9 +46,10 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
     def _start(self, command):
         task = self.runner.start(2001, len(self.tasks) + 1, command, None, 30000, now_ms() + 30000)
         self.tasks.append(task)
+        output_path = self.runner.output_dir / str(task.channel_id) / f"{task.seq}.stdout"
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            text = task.stdout_path.read_text().strip()
+            text = output_path.read_text().strip()
             if text:
                 child = int(text)
                 self.children.add(child)
@@ -201,7 +202,7 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
         self._observe_leader_exit(task)
         self._assert_child_running(child)
         worker = CmdWorker(CmdWorkerConfig(
-            protocol="cmd.v1", open_event=OpenEventConfig("127.0.0.1:9527"),
+            open_event=OpenEventConfig("127.0.0.1:9527"),
             principal=30001, token="token", channel_ids=(2001,),
             output_dir=self.runner.output_dir,
         ), object())
@@ -256,7 +257,7 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
         self._observe_leader_exit(exited)
         running, running_child = self._start('sleep 30 & printf "%s\\n" "$!"; wait')
         worker = CmdWorker(CmdWorkerConfig(
-            protocol="cmd.v1", open_event=OpenEventConfig("127.0.0.1:9527"),
+            open_event=OpenEventConfig("127.0.0.1:9527"),
             principal=30001, token="token", channel_ids=(2001,),
             output_dir=self.runner.output_dir,
         ), object())

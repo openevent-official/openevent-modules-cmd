@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +13,37 @@ from openevent.cmd_worker.runner import CommandRunner, CommandStartError, now_ms
 
 
 class RunnerTest(unittest.TestCase):
+    def test_missing_output_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CommandRunner(tmp).output_for(2001, 123, "stdout")
+            self.assertEqual(output.file, "2001/123.stdout")
+            self.assertEqual(output.bytes, 0)
+            self.assertEqual(output.content_encoding, "utf-8")
+            self.assertEqual(output.content, "")
+
+    def test_output_io_errors_are_not_reported_as_empty(self) -> None:
+        for operation in ("open", "fstat", "read"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                runner = CommandRunner(tmp)
+                path = Path(tmp) / "2001/123.stdout"
+                path.parent.mkdir()
+                path.write_bytes(b"command output")
+                failure = OSError(errno.EIO, "injected output I/O error", str(path))
+                with ExitStack() as patches:
+                    if operation == "open":
+                        patches.enter_context(patch.object(Path, "open", side_effect=failure))
+                    elif operation == "fstat":
+                        patches.enter_context(patch("openevent.cmd_worker.runner.os.fstat", side_effect=failure))
+                    else:
+                        handle = patches.enter_context(path.open("rb"))
+                        opened = patches.enter_context(patch.object(Path, "open"))
+                        reader = opened.return_value.__enter__.return_value
+                        reader.fileno.return_value = handle.fileno()
+                        reader.read.side_effect = failure
+                    with self.assertRaises(OSError) as raised:
+                        runner.output_for(2001, 123, "stdout")
+                    self.assertIs(raised.exception, failure)
+
     def test_command_writes_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runner = CommandRunner(tmp)

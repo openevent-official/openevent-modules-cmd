@@ -2,11 +2,7 @@
 
 [中文版](SDK_USAGE_cn.md)
 
-> Version: v0.1
-> Scope: Python callers that publish, parse, and handle `cmd.v1` messages.
-
-See [CMD_PROTOCOL.md](CMD_PROTOCOL.md) for the protocol specification. This
-document describes the public Python SDK interface.
+See the [protocol](CMD_PROTOCOL.md) for message formats.
 
 ## Public Interface
 
@@ -88,16 +84,12 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
   principal, recipients, and a validated payload model. Invalid payloads raise
   `CmdSDKError`, exposing `code` and `message`; OpenEvent RPC errors propagate
   unchanged.
-- Output content, encoding, states, and field rules are defined in the
-  [protocol](CMD_PROTOCOL.md). Read `content_encoding` alongside content.
-- The worker uses `Fetch(only_my_recipient=false, channels=channel_ids)` to read
-  requests and results from configured channels.
+- Read `content_encoding` alongside output content.
 
 ## Worker Publish Interface
 
-These methods are intended for workers. `request_principal` is the original
-request sender. The helper sets `recipients=[request_principal]`; there is no
-argument named `recipients`.
+`request_principal` is the original request sender. Publishing automatically sets
+`recipients=[request_principal]`.
 
 ```text
 client.publish_run_accepted(principal, token, channel_id, request_principal, prev_seq, *, uuid=None)
@@ -106,6 +98,5 @@ client.publish_kill_result(principal, token, channel_id, request_principal, resu
 client.publish_output_read_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
 ```
 
-These are method signatures. The three `result_payload` arguments use
-`CmdRunResultInput`, `CmdKillResultInput`, and `CmdOutputReadResultInput`,
-respectively. Like request methods, they return an integer seq.
+The three `result_payload` arguments use `CmdRunResultInput`, `CmdKillResultInput`,
+and `CmdOutputReadResultInput`, respectively.

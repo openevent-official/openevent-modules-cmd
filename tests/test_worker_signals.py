@@ -20,7 +20,7 @@ class WorkerSignalsTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.config = CmdWorkerConfig(
-            protocol="cmd.v1", open_event=OpenEventConfig("127.0.0.1:9527"),
+            open_event=OpenEventConfig("127.0.0.1:9527"),
             principal=30001, token="token", channel_ids=(2001,),
             output_dir=Path(directory.name), max_concurrent_tasks=2,
         )
@@ -167,7 +167,7 @@ class WorkerSignalsTest(unittest.TestCase):
                             seq, 2001, 1001, timestamp,
                             CmdRunRequest(command="exec sleep 30", timeout_ms=30000, ts_ms=timestamp),
                         )
-                        worker._handle_run_event(event, historical=False)
+                        worker._handle_run_event(event)
                     worker._drain_pending()
 
                 def start_then_signal(*args, **kwargs):

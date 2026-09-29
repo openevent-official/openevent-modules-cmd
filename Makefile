@@ -12,11 +12,12 @@ help:
 	@printf '  test     Run unit tests with temporary files under build/\n'
 	@printf '  check-sdk  Check the installed SDK dependency\n'
 	@printf '  check-docs  Check documentation links, translations, and dependency versions\n'
-	@printf '  e2e      Report that end-to-end tests are not implemented\n'
+	@printf '  e2e      Build and test the installed wheel with a real OpenEvent server\n'
 	@printf '  clean    Remove build artifacts and temporary work files\n\n'
 	@printf 'Variables:\n'
 	@printf '  PYTHON=%s\n' '$(PYTHON)'
 	@printf '  INSTALL_ARGS=%s\n' '$(INSTALL_ARGS)'
+	@printf '  OPENEVENT_SERVER_BIN=<path to an executable openevent_server> (required for e2e)\n'
 
 build:
 	PYTHON="$(PYTHON)" ./build.sh

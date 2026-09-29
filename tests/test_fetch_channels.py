@@ -80,7 +80,6 @@ class FetchChannelsTest(unittest.TestCase):
 
 def _config() -> CmdWorkerConfig:
     return CmdWorkerConfig(
-        protocol="cmd.v1",
         open_event=OpenEventConfig(addr="127.0.0.1:9527"),
         principal=30001,
         token="token",

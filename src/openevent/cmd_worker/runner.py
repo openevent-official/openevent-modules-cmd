@@ -23,8 +23,6 @@ class RunningCommand:
     channel_id: int
     seq: int
     process: subprocess.Popen
-    stdout_path: Path
-    stderr_path: Path
     started_at_ms: int
     timeout_ms: int
     deadline_ms: int
@@ -51,33 +49,23 @@ class CommandRunner:
             raise CommandStartError(f"cannot create channel output directory: {exc}") from exc
         stdout_path = channel_dir / f"{seq}.stdout"
         stderr_path = channel_dir / f"{seq}.stderr"
-        stdout_file = None
-        stderr_file = None
         try:
-            stdout_file = stdout_path.open("wb")
-            stderr_file = stderr_path.open("wb")
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=workdir,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-                close_fds=True,
-            )
+            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=workdir,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    close_fds=True,
+                )
         except (OSError, ValueError) as exc:
             raise CommandStartError(f"cannot open output files or start shell process: {exc}") from exc
-        finally:
-            if stdout_file is not None:
-                stdout_file.close()
-            if stderr_file is not None:
-                stderr_file.close()
         return RunningCommand(
             channel_id=channel_id,
             seq=seq,
             process=process,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
             started_at_ms=now_ms(),
             timeout_ms=timeout_ms,
             deadline_ms=deadline_ms,
@@ -151,7 +139,7 @@ def output_object(path: Path, channel_id: int, seq: int, stream: str) -> CmdOutp
             if size > INLINE_OUTPUT_BYTES:
                 return CmdOutput(file=rel_file, bytes=size)
             data = handle.read(min(size, INLINE_OUTPUT_BYTES))
-    except OSError:
+    except FileNotFoundError:
         return empty_output(rel_file)
     size = len(data)
     try:

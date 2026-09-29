@@ -2,10 +2,7 @@
 
 [English version](SDK_USAGE.md)
 
-> 版本：v0.1
-> 范围：发布、解析和处理 `cmd.v1` 消息的 Python 调用方。
-
-协议规格见 [CMD_PROTOCOL_cn.md](CMD_PROTOCOL_cn.md)。本文描述 Python SDK 的公开接口。
+消息格式见[协议](CMD_PROTOCOL_cn.md)。
 
 ## 公开接口
 
@@ -82,13 +79,11 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
   本辅助层不自动重试。UUID 复用和消息一致性规则以 OpenEvent SDK API 为准。
 - `parse_message(message)` 返回 `ParsedMessage`，包含顶层 seq、channel_id、principal、recipients 和已校验的 payload 模型。
   非法 payload 抛出 `CmdSDKError`，可读取其 `code` 和 `message`；OpenEvent RPC 错误保持原异常。
-- 输出内容、编码、状态和字段规则统一见[协议](CMD_PROTOCOL_cn.md)，读取内容时应同时读取 `content_encoding`。
-- worker 使用 `Fetch(only_my_recipient=false, channels=channel_ids)` 获取配置通道的请求和结果。
+- 读取输出内容时，同时读取 `content_encoding`。
 
 ## Worker 发布接口
 
-以下方法面向 worker。`request_principal` 是原请求的发送方，辅助函数自动写成
-`recipients=[request_principal]`，没有名为 `recipients` 的参数。
+`request_principal` 是原请求的发送方，发布时自动设置 `recipients=[request_principal]`。
 
 ```text
 client.publish_run_accepted(principal, token, channel_id, request_principal, prev_seq, *, uuid=None)
@@ -97,5 +92,4 @@ client.publish_kill_result(principal, token, channel_id, request_principal, resu
 client.publish_output_read_result(principal, token, channel_id, request_principal, result_payload, *, uuid=None)
 ```
 
-上面列出的是方法签名。三个 `result_payload` 分别使用 `CmdRunResultInput`、`CmdKillResultInput`、
-`CmdOutputReadResultInput`；发布函数与请求函数一样返回整数 seq。
+三个 `result_payload` 分别使用 `CmdRunResultInput`、`CmdKillResultInput` 和 `CmdOutputReadResultInput`。

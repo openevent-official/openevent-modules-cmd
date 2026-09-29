@@ -2,19 +2,17 @@
 
 [English version](CONFIGURATION.md)
 
-本文定义 `cmd-worker` YAML 配置及进程生命周期、启动恢复、退出的运行契约。worker 通过启动参数读取配置：
+通过 `--config` 指定 YAML 配置文件：
 
 ```bash
 cmd-worker --config cmd-worker.yaml
 ```
 
-仓库提供了可复制的示例文件：[../examples/cmd-worker.yaml](../examples/cmd-worker.yaml)。
+示例文件：[cmd-worker.yaml](../examples/cmd-worker.yaml)。
 
 ## 示例
 
 ```yaml
-protocol: cmd.v1
-
 open_event:
   addr: 127.0.0.1:9527
   max_payload_bytes: 16777216
@@ -34,46 +32,36 @@ fetch_error_max_retries: 3
 fetch_error_retry_sleep_ms: 1000
 ```
 
-只处理一个 channel 时，也使用单元素列表：
-
-```yaml
-channel_ids:
-  - 2001
-```
-
 ## 字段
 
 | 字段 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `protocol` | 是 | 无 | 必须为 `cmd.v1` |
 | `open_event.addr` | 是 | 无 | OpenEvent 服务地址 |
 | `open_event.max_payload_bytes` | 否 | `16777216` | OpenEvent 部署的消息 payload 大小上限，必须是至少 `16384`（16 KiB）的整数；所有 accepted/result 发布前检查最终大小，局部读取据此缩小返回量 |
 | `principal` | 是 | 无 | cmd-worker 使用的 OpenEvent principal，必须是正整数 |
 | `token` | 是 | 无 | cmd-worker 使用的 OpenEvent token，必须是非空字符串 |
-| `channel_ids` | 是 | 无 | cmd-worker 处理的 channel id 列表，必须是非空数组；每个元素必须是正整数，不能包含 `0`，不能重复 |
-| `output_dir` | 否 | `cmd-worker-output` | worker 本地输出根目录；stdout/stderr 文件会持续写入该目录，清理和容量保护由部署方负责 |
+| `channel_ids` | 是 | 无 | worker 处理的 channel id 列表，必须是非空、无重复的正整数数组 |
+| `output_dir` | 否 | `cmd-worker-output` | stdout/stderr 文件的本地根目录 |
 | `max_concurrent_tasks` | 否 | `8` | 同时运行的命令任务上限，必须是正整数 |
-| `default_timeout_ms` | 否 | `300000` | 默认命令超时，必须是 `1..18446744073709551615`（`2**64-1`）范围内的整数；请求缺失 `timeout_ms` 时使用当前配置，恢复处理同样如此 |
-| `fetch_idle_sleep_ms` | 否 | `100` | 主线程调度循环空闲时的 sleep 时间，必须是正整数 |
-| `fetch_error_max_retries` | 否 | `3` | 任意 `Fetch` 调用首次 RPC 异常后的最大重试次数，必须是正整数；普通程序异常和停止异常不重试 |
-| `fetch_error_retry_sleep_ms` | 否 | `1000` | `Fetch` RPC 异常后每次重试前的 sleep 时间，必须是正整数 |
+| `default_timeout_ms` | 否 | `300000` | 请求未指定 `timeout_ms` 时的超时值，整数范围 `1..18446744073709551615`（`2**64-1`） |
+| `fetch_idle_sleep_ms` | 否 | `100` | 调度循环空闲时的等待毫秒数，必须是正整数 |
+| `fetch_error_max_retries` | 否 | `3` | 每次 `Fetch` 首次 RPC 异常后的最大重试次数，必须是正整数 |
+| `fetch_error_retry_sleep_ms` | 否 | `1000` | `Fetch` RPC 异常后每次重试前的等待毫秒数，必须是正整数 |
 
 未知配置字段视为配置错误。
 
 ## Channel 要求
 
 `channel_ids` 中列出的每个 channel 必须满足[协议的通道规则](CMD_PROTOCOL_cn.md#1-通道)。
-worker 启动时逐个校验可读性、协议、visibility、worker 成员身份和 description；任一失败即退出。
-
-worker 只处理 `channel_ids` 中列出的 channel。未列出的 channel 即使 protocol 是 `cmd.v1`，也不属于该
-worker 的处理范围。
+worker 启动时逐个校验可读性、协议、visibility 和 worker 成员身份；任一失败即退出。
 
 ## 运行注意事项
 
 - `output_dir` 可以是相对路径或绝对路径；相对路径按启动 `cmd-worker` 时的当前工作目录解析。
-- worker 启动时会创建并写入 `output_dir`，如果目录无法创建或不可写，会报配置/环境错误并退出。
-- 每个 channel 的输出会写入 `output_dir/<channel_id>/`，不同 channel 的输出文件不会混用。
-- 当前实现不自动清理输出文件，也不限制单个命令的 stdout/stderr 文件大小。
+- 启动时创建并检查 `output_dir`；无法创建或写入时，报配置/环境错误并退出。
+- 输出写入 `output_dir/<channel_id>/`，不自动清理，也不限制文件大小；清理和容量保护由部署方负责。
+- 并发已满时继续消费消息并在内存排队。待执行队列、恢复扫描中尚未闭合的请求和已完成 run 的标识集合
+  没有总量上限；已完成的 kill、输出查询及 run 的 accepted 记录不长期保留。
 
 ## 任务进程生命周期
 
@@ -82,10 +70,10 @@ worker 的处理范围。
 
 自然结束后的组清理不把结果改成 KILLED；结果仍按 shell 退出码决定。已经确定的超时或 kill 原因保留，
 具体状态以[运行结果协议](CMD_PROTOCOL_cn.md#5-cmdrunresult)为准。正常完成、超时、kill 和 worker
-可捕获退出都使用同一清理与回收流程；结果发布规则仍按对应协议或恢复契约处理。
+可捕获退出都使用同一清理与回收流程。
 
 清理范围仅包括该任务创建的同一进程组。主动通过 `setsid`/`setpgid` 脱离该组的进程不在追踪范围，
-worker 不提供 cgroup 或完整进程树管理，也不恢复或清理历史 worker 遗留的进程。
+worker 不提供 cgroup 或完整进程树管理。
 
 ## 恢复与退出
 
@@ -101,13 +89,13 @@ worker 启动时从头读取历史，以第一次 Fetch 返回的消息尾部固
   输出读取不会重建崩溃前的文件快照。
 
 运行请求没有显式 `timeout_ms` 时，恢复处理使用当前 `default_timeout_ms`，包括补写
-`RECOVERY_FAILED` 时的结果字段；不追溯重启前的默认配置。请求显式给出的超时保持原值。
+`RECOVERY_FAILED` 时的结果字段。请求显式给出的超时保持原值。
 
-Fetch RPC 异常按上表重试；重试耗尽则 worker 退出。accepted/result 明确发布失败、重试后仍无法
-确认写入，或无法查询已存在 UUID 对应的 seq 时，也会退出。普通程序异常和停止异常直接传播，不走 RPC 重试。
+Fetch RPC 异常按上表重试；重试耗尽则 worker 退出。accepted/result 明确发布失败或重试后仍无法
+确认写入时，也会退出。普通程序异常和停止异常直接传播，不走 RPC 重试。
 这些退出路径以及 Ctrl+C、SIGTERM 都会按[任务进程生命周期](#任务进程生命周期)清理当前 worker
 尚未收尾的任务并回收 shell；尚未写回结果的请求由下次启动恢复处理。
 清理期间收到 SIGINT/SIGTERM 不会打断剩余任务的清理。由停止信号触发退出时，CLI 保留首次停止信号对应的退出码。
 
 强制结束 worker 或主机故障无法保证进程清理。恢复不会终止历史 worker 遗留的 OS 进程，也不承诺命令
-执行 exactly-once；进程或主机故障后的业务补偿由调用方决定。
+执行 exactly-once。

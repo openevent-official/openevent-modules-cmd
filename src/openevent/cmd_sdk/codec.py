@@ -78,10 +78,10 @@ def identify_kind(payload: bytes) -> str | None:
     return None
 
 
-def run_request_input_to_dict(req: CmdRunRequestInput, ts_ms: int | None = None) -> dict[str, Any]:
+def run_request_input_to_dict(req: CmdRunRequestInput) -> dict[str, Any]:
     data: dict[str, Any] = {
         "kind": KIND_RUN_REQUEST,
-        "ts_ms": req.ts_ms if req.ts_ms is not None else ts_ms or now_ms(),
+        "ts_ms": req.ts_ms if req.ts_ms is not None else now_ms(),
         "command": req.command,
     }
     if req.workdir is not None:
@@ -91,8 +91,8 @@ def run_request_input_to_dict(req: CmdRunRequestInput, ts_ms: int | None = None)
     return data
 
 
-def run_accepted_to_dict(prev_seq: int, ts_ms: int | None = None) -> dict[str, Any]:
-    return {"kind": KIND_RUN_ACCEPTED, "prev_seq": prev_seq, "ts_ms": ts_ms if ts_ms is not None else now_ms()}
+def run_accepted_to_dict(prev_seq: int) -> dict[str, Any]:
+    return {"kind": KIND_RUN_ACCEPTED, "prev_seq": prev_seq, "ts_ms": now_ms()}
 
 
 def run_result_input_to_dict(result: CmdRunResultInput) -> dict[str, Any]:
@@ -116,8 +116,8 @@ def run_result_input_to_dict(result: CmdRunResultInput) -> dict[str, Any]:
     return data
 
 
-def kill_request_input_to_dict(req: CmdKillRequestInput, ts_ms: int | None = None) -> dict[str, Any]:
-    return {"kind": KIND_KILL_REQUEST, "ts_ms": req.ts_ms if req.ts_ms is not None else ts_ms or now_ms(), "target_seq": req.target_seq}
+def kill_request_input_to_dict(req: CmdKillRequestInput) -> dict[str, Any]:
+    return {"kind": KIND_KILL_REQUEST, "ts_ms": req.ts_ms if req.ts_ms is not None else now_ms(), "target_seq": req.target_seq}
 
 
 def kill_result_input_to_dict(result: CmdKillResultInput) -> dict[str, Any]:
@@ -134,10 +134,10 @@ def kill_result_input_to_dict(result: CmdKillResultInput) -> dict[str, Any]:
     return data
 
 
-def output_read_request_input_to_dict(req: CmdOutputReadRequestInput, ts_ms: int | None = None) -> dict[str, Any]:
+def output_read_request_input_to_dict(req: CmdOutputReadRequestInput) -> dict[str, Any]:
     return {
         "kind": KIND_OUTPUT_READ_REQUEST,
-        "ts_ms": req.ts_ms if req.ts_ms is not None else ts_ms or now_ms(),
+        "ts_ms": req.ts_ms if req.ts_ms is not None else now_ms(),
         "target_seq": req.target_seq,
         "stream": req.stream,
         "offset": req.offset,

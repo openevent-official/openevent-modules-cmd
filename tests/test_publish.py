@@ -32,7 +32,6 @@ class EventStub:
         self.publishes = []
         self.lookups = []
         self.outcomes = []
-        self.lookup_error = None
         self.committed = {}
 
     def AllocateUuids(self, request, *, timeout):
@@ -55,9 +54,7 @@ class EventStub:
 
     def GetSeqByUuid(self, request, *, timeout):
         self.lookups.append((request, timeout))
-        if self.lookup_error is not None:
-            raise self.lookup_error
-        return SimpleNamespace(seq=self.committed[request.uuid][0])
+        raise RpcFailure(grpc.StatusCode.UNAVAILABLE)
 
 
 def run_result():
@@ -144,7 +141,7 @@ class PublishTest(unittest.TestCase):
                 with patch.object(client, "get_uuid", wraps=client.get_uuid) as allocate:
                     with patch("openevent.cmd_sdk.codec.now_ms", side_effect=[123, 456]) as timestamp:
                         published = publisher.publish_run_accepted(2001, 1001, 10)
-                self.assertEqual(published.seq, 100)
+                self.assertIsNone(published)
                 allocate.assert_called_once_with()
                 timestamp.assert_called_once_with()
                 self.assertEqual(len(stub.publishes), 2)
@@ -153,27 +150,21 @@ class PublishTest(unittest.TestCase):
                 self.assertEqual(len(stub.committed), 1)
                 self.assertEqual(stub.lookups, [])
 
-    def test_committed_publish_with_lost_response_resolves_existing_uuid(self):
-        publisher, client, stub = self.publisher()
-        stub.outcomes = ["commit_then_disconnect"]
-        with patch.object(client, "get_uuid", wraps=client.get_uuid) as allocate:
-            published = publisher.publish_run_accepted(2001, 1001, 10)
-        allocate.assert_called_once_with()
-        self.assertEqual(published.seq, 100)
-        self.assertEqual(len(stub.publishes), 2)
-        self.assertEqual(len(stub.committed), 1)
-        self.assertEqual(len(stub.lookups), 1)
-        first, second = (request for request, _ in stub.publishes)
-        self.assertEqual(first.SerializeToString(), second.SerializeToString())
-        self.assertEqual(stub.lookups[0][0].uuid, first.uuid)
-
-    def test_already_exists_queries_committed_sequence_without_retry(self):
-        publisher, _, stub = self.publisher()
-        stub.committed[7000] = (89, b"already committed")
-        published = publisher.publish_run_accepted(2001, 1001, 10)
-        self.assertEqual(published.seq, 89)
-        self.assertEqual(len(stub.publishes), 1)
-        self.assertEqual([request.uuid for request, _ in stub.lookups], [7000])
+    def test_all_worker_outputs_accept_committed_uuid_without_sequence_lookup(self):
+        for kind, method, value in worker_outputs():
+            with self.subTest(kind=kind):
+                publisher, client, stub = self.publisher()
+                stub.outcomes = ["commit_then_disconnect"]
+                with patch.object(client, "get_uuid", wraps=client.get_uuid) as allocate:
+                    published = getattr(publisher, method)(2001, 1001, value)
+                self.assertIsNone(published)
+                allocate.assert_called_once_with()
+                self.assertEqual(len(stub.publishes), 2)
+                self.assertEqual(len(stub.committed), 1)
+                self.assertEqual(stub.lookups, [])
+                first, second = (request for request, _ in stub.publishes)
+                self.assertEqual(first.SerializeToString(), second.SerializeToString())
+                self.assertEqual(json.loads(first.payload)["kind"], kind)
 
     def test_definite_publish_errors_are_not_retried(self):
         for status in (
@@ -192,16 +183,6 @@ class PublishTest(unittest.TestCase):
                 allocate.assert_called_once_with()
                 self.assertEqual(len(stub.publishes), 1)
                 self.assertEqual(stub.lookups, [])
-
-    def test_uuid_lookup_failure_is_fatal(self):
-        publisher, _, stub = self.publisher()
-        stub.outcomes = [RpcFailure(grpc.StatusCode.ALREADY_EXISTS)]
-        stub.lookup_error = RpcFailure(grpc.StatusCode.UNAVAILABLE)
-        with self.assertRaises(PublishFatal) as raised:
-            publisher.publish_run_accepted(2001, 1001, 10)
-        self.assertIs(raised.exception.__cause__, stub.lookup_error)
-        self.assertEqual(len(stub.publishes), 1)
-        self.assertEqual(len(stub.lookups), 1)
 
     def test_two_uncertain_failures_are_fatal(self):
         publisher, client, stub = self.publisher()

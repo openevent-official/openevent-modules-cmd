@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from openevent.cmd_sdk.model import KIND_KILL_RESULT, KIND_OUTPUT_READ_RESULT, KIND_RUN_RESULT
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
@@ -19,7 +20,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.config = CmdWorkerConfig(
-            protocol="cmd.v1", open_event=OpenEventConfig("unused"),
+            open_event=OpenEventConfig("unused"),
             principal=30001, token="token", channel_ids=(2001,),
             output_dir=Path(directory.name), default_timeout_ms=600000,
         )
@@ -45,12 +46,13 @@ class WorkerRecoveryTest(unittest.TestCase):
         ])
         worker = CmdWorker(self.config, client)
         worker.resolver.validate_startup()
-        events = worker._scan_history()
-        self.assertEqual([event.seq for event in events], [2, 5])
-        self.assertTrue(worker._has_result(2001, KIND_RUN_RESULT, 1))
-        self.assertEqual(worker.accepted[(2001, 1)], 3)
+        recovery = worker._scan_history()
+        self.assertEqual([event.seq for event in recovery.requests.values()], [2, 5])
+        self.assertTrue(worker._has_run_result(2001, 1))
+        self.assertFalse(recovery.accepted)
         self.assertEqual(worker.next_fetch_seq, 6)
-        self.assertEqual([item.seq for item in worker._fetch_round()], [6])
+        self.assertEqual(worker._fetch_round(), (True, False))
+        self.assertEqual([event.seq for event in worker.pending.values()], [6])
         self.assertEqual([call.kwargs["from_seq"] for call in client.fetch.call_args_list], [1, 3, 6])
 
     def test_empty_filtered_page_does_not_end_recovery_early(self):
@@ -62,7 +64,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         ])
         worker = CmdWorker(self.config, client)
         worker.resolver.validate_startup()
-        self.assertEqual([event.seq for event in worker._scan_history()], [5])
+        self.assertEqual([event.seq for event in worker._scan_history().requests.values()], [5])
         self.assertEqual(worker.next_fetch_seq, 6)
 
     def test_scan_closes_all_request_kinds_across_pages_and_channels(self):
@@ -107,38 +109,104 @@ class WorkerRecoveryTest(unittest.TestCase):
         worker = CmdWorker(replace(self.config, channel_ids=(2001, 2002)), client)
         worker.resolver.validate_startup()
 
-        events = worker._scan_history()
+        recovery = worker._scan_history()
+        events = list(recovery.requests.values())
 
         self.assertEqual([(event.channel_id, event.seq) for event in events],
                          [(2002, 5), (2001, 6), (2002, 7), (2001, 8)])
         self.assertIsInstance(events[-1], InvalidRequestEvent)
-        self.assertEqual(worker.results, {
-            (2001, KIND_RUN_RESULT, 1): 10,
-            (2002, KIND_KILL_RESULT, 2): 11,
-            (2001, KIND_OUTPUT_READ_RESULT, 3): 12,
-            (2002, KIND_RUN_RESULT, 4): 13,
-        })
+        self.assertEqual(worker.finished_runs, {(2001, 1), (2002, 4)})
+        self.assertFalse(recovery.accepted)
         self.assertEqual(worker.next_fetch_seq, 14)
 
-    def test_scan_still_rejects_duplicate_accepted_and_result_across_pages(self):
-        payloads = [
-            {"kind": "cmd.run.accepted", "prev_seq": 1, "ts_ms": 1000},
-            {"ts_ms": 1000, **_run_result(1, 2001, "START_FAILED")},
-        ]
-        for payload in payloads:
-            with self.subTest(kind=payload["kind"]):
-                client = FakeClient()
-                client.fetch = Mock(side_effect=[
-                    SimpleNamespace(messages=[
-                        message(1, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
-                        message(2, payload, 30001),
-                    ], next_seq=3, last_seq=3),
-                    SimpleNamespace(messages=[message(3, payload, 30001)], next_seq=4),
-                ])
-                worker = CmdWorker(self.config, client)
-                worker.resolver.validate_startup()
-                with self.assertRaisesRegex(RuntimeError, "duplicate"):
-                    worker._scan_history()
+    def test_scan_releases_closed_requests_and_acceptances_before_next_page(self):
+        client = FakeClient()
+        worker = CmdWorker(self.config, client)
+        worker.resolver.validate_startup()
+        states = []
+        event_refs = []
+        observe = worker._observe_message
+
+        def track(item, *, recovery=None):
+            states[:] = [recovery]
+            event = observe(item, recovery=recovery)
+            if event is not None and event.seq <= 4:
+                event_refs.append(weakref.ref(event))
+            return event
+
+        def fetch(principal, token, *, from_seq, **kwargs):
+            if from_seq == 1:
+                return SimpleNamespace(messages=[
+                    message(1, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+                    message(2, {"kind": "cmd.run.accepted", "prev_seq": 1, "ts_ms": 1000}, 30001),
+                    message(3, {"kind": "cmd.kill.request", "ts_ms": 1000, "target_seq": 1}),
+                    message(4, {"kind": "cmd.output.read.request", "ts_ms": 1000,
+                                "target_seq": 1, "stream": "stdout", "offset": 0, "nbytes": 10}),
+                ], next_seq=5, last_seq=10)
+            if from_seq == 5:
+                self.assertEqual(len(states[0].requests), 3)
+                self.assertEqual(states[0].accepted, {(2001, 1)})
+                return SimpleNamespace(messages=[
+                    message(5, {"ts_ms": 1000, **_run_result(1, 2001, "START_FAILED")}, 30001),
+                    message(6, {"kind": KIND_KILL_RESULT, "ts_ms": 1000, "prev_seq": 3,
+                                "target_seq": 1, "status": "ALREADY_FINISHED"}, 30001),
+                    message(7, {"kind": KIND_OUTPUT_READ_RESULT, "ts_ms": 1000, "prev_seq": 4,
+                                "target_seq": 1, "stream": "stdout", "offset": 0, "nbytes": 10,
+                                "status": "NOT_FOUND", "content": "", "bytes": 0,
+                                "eof": True, "content_encoding": "utf-8"}, 30001),
+                ], next_seq=8)
+            self.assertEqual(from_seq, 8)
+            self.assertFalse(states[0].requests)
+            self.assertFalse(states[0].accepted)
+            self.assertEqual(len(event_refs), 3)
+            self.assertTrue(all(reference() is None for reference in event_refs))
+            return SimpleNamespace(messages=[
+                message(8, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+                message(9, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+                message(10, {"kind": "cmd.run.accepted", "prev_seq": 9, "ts_ms": 1000}, 30001),
+            ], next_seq=11)
+
+        worker._observe_message = track
+        client.fetch = fetch
+        recovery = worker._scan_history()
+
+        self.assertEqual([event.seq for event in recovery.requests.values()], [8, 9])
+        self.assertEqual(recovery.accepted, {(2001, 9)})
+        self.assertEqual(worker.finished_runs, {(2001, 1)})
+
+    def test_startup_replays_in_order_and_releases_recovery_state_before_starting(self):
+        client = FakeClient([
+            message(1, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+            message(2, {"kind": "cmd.run.accepted", "prev_seq": 1, "ts_ms": 1000}, 30001),
+            message(3, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+            message(4, {"kind": "cmd.kill.request", "ts_ms": 1000, "target_seq": 3}),
+            message(5, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+        ])
+        worker = CmdWorker(self.config, client)
+        worker.publisher = RecordingPublisher()
+        scan = worker._scan_history
+        state_refs = []
+
+        def track_scan():
+            recovery = scan()
+            state_refs.append(weakref.ref(recovery))
+            return recovery
+
+        def start(event):
+            self.assertEqual(event.seq, 5)
+            self.assertIsNone(state_refs[0]())
+            self.assertEqual([(item["kind"], item["status"]) for item in worker.publisher.records], [
+                (KIND_RUN_RESULT, "RECOVERY_FAILED"),
+                (KIND_RUN_RESULT, "KILLED"),
+                (KIND_KILL_RESULT, "REMOVED_PENDING"),
+            ])
+
+        with patch.object(worker, "_scan_history", side_effect=track_scan), \
+                patch.object(worker, "_start_or_timeout", side_effect=start) as start_command:
+            worker.startup()
+
+        start_command.assert_called_once()
+        self.assertEqual(worker.finished_runs, {(2001, 1), (2001, 3)})
 
     def test_recovery_uses_current_default_only_when_request_omits_timeout(self):
         for requested, expected in ((None, 600000), (10000, 10000)):

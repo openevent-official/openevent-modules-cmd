@@ -6,10 +6,10 @@ from packaging.version import InvalidVersion, Version
 
 
 def require_sdk() -> None:
-    requirement = "openevent-sdk>=0.8.1"
+    requirement = "openevent-sdk>=0.11.1"
     try:
         installed = version("openevent-sdk")
-        if Version(installed) >= Version("0.8.1"):
+        if Version(installed) >= Version("0.11.1"):
             return
     except (PackageNotFoundError, InvalidVersion):
         installed = "missing or invalid"

@@ -30,7 +30,6 @@ class WorkerOutputReadTest(unittest.TestCase):
     def test_run_stops_worker_after_runtime_error(self) -> None:
         worker = CmdWorker(
             CmdWorkerConfig(
-                protocol="cmd.v1",
                 open_event=OpenEventConfig(addr="127.0.0.1:9527"),
                 principal=30001,
                 token="token",
@@ -52,7 +51,6 @@ class WorkerOutputReadTest(unittest.TestCase):
     def test_wait_task_reports_internal_error_to_main_thread(self) -> None:
         worker = CmdWorker(
             CmdWorkerConfig(
-                protocol="cmd.v1",
                 open_event=OpenEventConfig(addr="127.0.0.1:9527"),
                 principal=30001,
                 token="token",
@@ -76,7 +74,6 @@ class WorkerOutputReadTest(unittest.TestCase):
             output_path = channel_dir / "123.stdout"
             output_path.write_bytes(b"\x00" * (1024 * 1024))
             config = CmdWorkerConfig(
-                protocol="cmd.v1",
                 open_event=OpenEventConfig(addr="127.0.0.1:9527", max_payload_bytes=512),
                 principal=30001,
                 token="token",
@@ -138,7 +135,6 @@ class WorkerOutputReadTest(unittest.TestCase):
     def test_invalid_output_read_does_not_echo_bool_int_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = CmdWorkerConfig(
-                protocol="cmd.v1",
                 open_event=OpenEventConfig(addr="127.0.0.1:9527"),
                 principal=30001,
                 token="token",

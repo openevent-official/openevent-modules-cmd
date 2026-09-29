@@ -11,13 +11,14 @@ from unittest.mock import Mock, patch
 from openevent.cmd_sdk.codec import (
     dumps_payload,
     kill_result_input_to_dict,
+    output_read_result_input_to_dict,
     run_accepted_to_dict,
     run_result_input_to_dict,
 )
-from openevent.cmd_sdk.model import KIND_RUN_RESULT, CmdKillRequest, CmdRunRequest
+from openevent.cmd_sdk.model import CmdKillRequest, CmdOutputReadRequest, CmdRunRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import RunningCommand
-from openevent.cmd_worker.worker import CmdWorker, KillEvent, RunEvent
+from openevent.cmd_worker.worker import CmdWorker, KillEvent, OutputReadEvent, RunEvent
 from openevent.sdk.proto import openevent_pb2
 
 
@@ -41,7 +42,7 @@ class FakeClient:
             protocol="cmd.v1",
             visibility=openevent_pb2.VISIBILITY_PRIVATE,
             members=[principal],
-            description='{"version":"v1","updated_at_ms":1}',
+            description="Command execution",
         ))
 
     def fetch(self, principal, token, *, from_seq, **kwargs):
@@ -80,6 +81,9 @@ class RecordingPublisher:
             raise RuntimeError("worker crashed before kill result was persisted")
         return self._publish(kill_result_input_to_dict(result))
 
+    def publish_output_read_result(self, channel_id, request_principal, result):
+        return self._publish(output_read_result_input_to_dict(result))
+
 
 class FakeProcess:
     def __init__(self, returncode=None):
@@ -99,7 +103,6 @@ class WorkerLifecycleTest(unittest.TestCase):
         self.output_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.output_dir.cleanup)
         self.config = CmdWorkerConfig(
-            protocol="cmd.v1",
             open_event=OpenEventConfig(addr="127.0.0.1:9527"),
             principal=30001,
             token="token",
@@ -136,8 +139,6 @@ class WorkerLifecycleTest(unittest.TestCase):
             channel_id=2001,
             seq=event.seq,
             process=FakeProcess(returncode),
-            stdout_path=self.config.output_dir / "2001/1.stdout",
-            stderr_path=self.config.output_dir / "2001/1.stderr",
             started_at_ms=1100,
             timeout_ms=1000,
             deadline_ms=2000,
@@ -148,7 +149,7 @@ class WorkerLifecycleTest(unittest.TestCase):
 
     def test_pending_cancel_persists_target_result_before_kill_result(self):
         worker = self.worker()
-        worker._handle_run_event(self.run_event(), historical=False)
+        worker._handle_run_event(self.run_event())
         worker._handle_kill_event(self.kill_event())
 
         self.assertEqual(
@@ -164,7 +165,7 @@ class WorkerLifecycleTest(unittest.TestCase):
         events = [self.run_event(seq, channel_id) for seq, channel_id in
                   ((1, 2001), (2, 2002), (3, 2001), (4, 2002))]
         for event in events:
-            worker._handle_run_event(event, historical=False)
+            worker._handle_run_event(event)
 
         # The same target exists only in channel 2002. An earlier kill in
         # channel 2001 must leave every queued request in place.
@@ -186,7 +187,7 @@ class WorkerLifecycleTest(unittest.TestCase):
 
     def test_restart_between_cancel_results_does_not_restart_target(self):
         worker = self.worker()
-        worker._handle_run_event(self.run_event(), historical=False)
+        worker._handle_run_event(self.run_event())
         worker.publisher.fail_kill_result = True
         with self.assertRaisesRegex(RuntimeError, "worker crashed"):
             worker._handle_kill_event(self.kill_event())
@@ -208,7 +209,7 @@ class WorkerLifecycleTest(unittest.TestCase):
         )
         self.assertFalse(recovered.pending)
         self.assertFalse(recovered.requests)
-        self.assertTrue(recovered._has_result(2001, KIND_RUN_RESULT, 1))
+        self.assertTrue(recovered._has_run_result(2001, 1))
 
     def test_accepted_delay_past_deadline_does_not_start_command(self):
         worker = self.worker()
@@ -216,7 +217,7 @@ class WorkerLifecycleTest(unittest.TestCase):
         worker.publisher.on_accepted = lambda: clock.__setitem__(0, 2100)
         worker.runner.start = Mock(side_effect=AssertionError("expired command must not start"))
         with patch("openevent.cmd_worker.worker.now_ms", side_effect=lambda: clock[0]):
-            worker._handle_run_event(self.run_event(), historical=False)
+            worker._handle_run_event(self.run_event())
             worker._drain_pending()
 
         worker.runner.start.assert_not_called()
@@ -263,7 +264,7 @@ class WorkerLifecycleTest(unittest.TestCase):
         self.assertNotIn("exit_code", worker.publisher.records[0])
         self.assertFalse(worker.requests)
 
-    def test_completion_releases_request_but_keeps_result_index(self):
+    def test_completion_releases_request_but_remembers_finished_run(self):
         worker = self.worker()
         task = self.running_task(worker, returncode=0)
         worker._wait_task(task)
@@ -272,15 +273,50 @@ class WorkerLifecycleTest(unittest.TestCase):
         self.assertEqual(worker.publisher.records[-1]["status"], "SUCCESS")
         self.assertFalse(worker.running)
         self.assertFalse(worker.requests)
-        self.assertTrue(worker._has_result(2001, KIND_RUN_RESULT, 1))
+        self.assertTrue(worker._has_run_result(2001, 1))
+
+    def test_completed_queries_kills_and_reply_readback_keep_only_finished_runs(self):
+        self.config = replace(self.config, channel_ids=(2001, 2002))
+        worker = self.worker()
+        worker.resolver.validate_startup()
+        task = self.running_task(worker, returncode=0)
+        output_path = self.config.output_dir / str(task.channel_id) / f"{task.seq}.stdout"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"hello")
+        worker._wait_task(task)
+        worker._drain_completions()
+
+        for seq in range(2, 66, 2):
+            request = CmdOutputReadRequest(target_seq=1, stream="stdout", offset=0, nbytes=5, ts_ms=1001)
+            worker._handle_event(OutputReadEvent(seq, 2001, 1001, request))
+            self.assertEqual(worker.publisher.records[-1]["content"], "hello")
+            worker._handle_event(self.kill_event(seq + 1))
+            self.assertEqual(worker.publisher.records[-1]["status"], "ALREADY_FINISHED")
+
+        # Replies are read back on later Fetch rounds, after local publication
+        # has already recorded the completed run.
+        worker._observe_realtime_message(
+            message(99, {"kind": "cmd.run.accepted", "prev_seq": 1, "ts_ms": 1000}, 30001)
+        )
+        for item in worker.publisher.messages:
+            worker._observe_realtime_message(item)
+        worker._handle_event(KillEvent(66, 2002, 1001, CmdKillRequest(target_seq=1, ts_ms=1001)))
+
+        self.assertEqual(worker.publisher.records[-1]["status"], "NOT_FOUND")
+        self.assertEqual(worker.finished_runs, {(2001, 1)})
+        self.assertFalse(worker.requests)
+        self.assertFalse(worker.running)
+        self.assertFalse(worker.pending)
+        self.assertFalse(hasattr(worker, "accepted"))
+        self.assertFalse(hasattr(worker, "results"))
 
     def test_full_slots_with_pending_command_sleep_when_no_progress(self):
         worker = self.worker()
         self.running_task(worker)
-        worker._handle_run_event(self.run_event(seq=2), historical=False)
+        worker._handle_run_event(self.run_event(seq=2))
         worker.startup = Mock()
         worker.stop = Mock()
-        worker._fetch_round = Mock(side_effect=[[], AssertionError("worker polled again without sleeping")])
+        worker._fetch_round = Mock(side_effect=[(False, False), AssertionError("worker polled again without sleeping")])
 
         def stop_after_sleep(seconds):
             worker.stopping = True

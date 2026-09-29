@@ -24,7 +24,6 @@ class OpenEventConfig:
 
 @dataclass(frozen=True)
 class CmdWorkerConfig:
-    protocol: str
     open_event: OpenEventConfig
     principal: int
     token: str
@@ -56,7 +55,6 @@ def parse_config(data: dict[str, Any]) -> CmdWorkerConfig:
     _reject_unknown(
         data,
         {
-            "protocol",
             "open_event",
             "principal",
             "token",
@@ -69,9 +67,6 @@ def parse_config(data: dict[str, Any]) -> CmdWorkerConfig:
             "fetch_error_retry_sleep_ms",
         },
     )
-    protocol = _required_str(data, "protocol")
-    if protocol != "cmd.v1":
-        raise ConfigError("protocol must be cmd.v1")
     open_event_data = _required_dict(data, "open_event")
     _reject_unknown(open_event_data, {"addr", "max_payload_bytes"})
     max_payload_bytes = _optional_positive_int(open_event_data, "max_payload_bytes", DEFAULT_MAX_PAYLOAD_BYTES)
@@ -82,7 +77,6 @@ def parse_config(data: dict[str, Any]) -> CmdWorkerConfig:
     if default_timeout_ms > MAX_TIMEOUT_MS:
         raise ConfigError(f"default_timeout_ms must be in 1..{MAX_TIMEOUT_MS}")
     return CmdWorkerConfig(
-        protocol=protocol,
         open_event=OpenEventConfig(addr=_required_str(open_event_data, "addr"), max_payload_bytes=max_payload_bytes),
         principal=_required_positive_int(data, "principal"),
         token=_required_str(data, "token"),

@@ -28,7 +28,7 @@ class RecordingClient:
 
 class ResultLimitsTest(unittest.TestCase):
     def test_config_rejects_insufficient_result_budget(self):
-        data = dict(protocol='cmd.v1', principal=1, token='token', channel_ids=[1])
+        data = dict(principal=1, token='token', channel_ids=[1])
         for size in (1, 512, 16383):
             with self.subTest(size=size), self.assertRaises(ConfigError):
                 parse_config(dict(data, open_event=dict(addr='localhost:9527', max_payload_bytes=size)))
@@ -45,7 +45,7 @@ class ResultLimitsTest(unittest.TestCase):
                 (channel_dir / f'{value}.{stream}').write_bytes(b'\x00' * 1024)
             client = RecordingClient()
             worker = CmdWorker(CmdWorkerConfig(
-                protocol='cmd.v1', open_event=OpenEventConfig('localhost:9527', 16384),
+                open_event=OpenEventConfig('localhost:9527', 16384),
                 principal=1, token='token', channel_ids=(value,), output_dir=root,
             ), client)
             event = RunEvent(value, value, 1, 1000, CmdRunRequest(command='true', timeout_ms=value, ts_ms=1000))
@@ -65,7 +65,7 @@ class ResultLimitsTest(unittest.TestCase):
             (root / '1').mkdir()
             (root / '1/1.stdout').write_bytes(b'x')
             worker = CmdWorker(CmdWorkerConfig(
-                protocol='cmd.v1', open_event=OpenEventConfig('localhost:9527', 150),
+                open_event=OpenEventConfig('localhost:9527', 150),
                 principal=1, token='token', channel_ids=(1,), output_dir=root,
             ), RecordingClient())
             event = OutputReadEvent(2, 1, 1, CmdOutputReadRequest(target_seq=1, stream='stdout', offset=0, nbytes=1, ts_ms=1))
@@ -73,11 +73,11 @@ class ResultLimitsTest(unittest.TestCase):
                 worker._build_output_read_result(event)
 
     def test_installed_sdk_version_uses_packaging_semantics(self):
-        for version in ('0.8.0', '0.8.1rc1'):
+        for version in ('0.8.1', '0.11.0', '0.11.1rc1'):
             with self.subTest(version=version), patch('openevent.cmd_sdk.dependencies.version', return_value=version):
-                with self.assertRaisesRegex(RuntimeError, 'openevent-sdk>=0.8.1'):
+                with self.assertRaisesRegex(RuntimeError, 'openevent-sdk>=0.11.1'):
                     require_sdk()
-        for version in ('0.8.1', '0.8.1+local', '0.9.0'):
+        for version in ('0.11.1', '0.11.1+local', '0.12.0'):
             with self.subTest(version=version), patch('openevent.cmd_sdk.dependencies.version', return_value=version):
                 require_sdk()
 

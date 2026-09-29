@@ -22,7 +22,7 @@ class WorkerStartTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.config = CmdWorkerConfig(
-            protocol="cmd.v1", open_event=OpenEventConfig("unused"),
+            open_event=OpenEventConfig("unused"),
             principal=30001, token="token", channel_ids=(2001,),
             output_dir=self.root / "output", max_concurrent_tasks=1,
         )
@@ -60,7 +60,7 @@ class WorkerStartTest(unittest.TestCase):
 
         def schedule(seq, directory, command="printf hello"):
             request = CmdRunRequest(command=command, workdir=str(directory), timeout_ms=30000, ts_ms=timestamp)
-            worker._handle_run_event(RunEvent(seq, 2001, 1001, timestamp, request), historical=False)
+            worker._handle_run_event(RunEvent(seq, 2001, 1001, timestamp, request))
             worker._drain_pending()
 
         with start_context if start_context is not None else nullcontext():
