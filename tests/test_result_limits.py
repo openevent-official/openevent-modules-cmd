@@ -49,7 +49,6 @@ class ResultLimitsTest(unittest.TestCase):
                 principal=1, token='token', channel_ids=(value,), output_dir=root,
             ), client)
             event = RunEvent(value, value, 1, 1000, CmdRunRequest(command='true', timeout_ms=value, ts_ms=1000))
-            worker.requests[(value, value)] = event
             worker._publish_run_result(event, 'RECOVERY_FAILED', timeout_ms=value, error_message='\x01' * 20000)
             payload = client.payloads[0]
             self.assertLessEqual(len(payload), 16384)
@@ -57,7 +56,8 @@ class ResultLimitsTest(unittest.TestCase):
             self.assertEqual(data['stdout']['content'], '\x00' * 1024)
             self.assertEqual(data['stderr']['content'], '\x00' * 1024)
             self.assertEqual(len(data['error_message'].encode('utf-8')), 512)
-            self.assertFalse(worker.requests)
+            self.assertFalse(worker.pending)
+            self.assertFalse(worker.running)
 
     def test_output_envelope_too_large_never_returns_unsendable_empty_success(self):
         with tempfile.TemporaryDirectory() as directory:

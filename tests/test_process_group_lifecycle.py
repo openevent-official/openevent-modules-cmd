@@ -17,7 +17,7 @@ from unittest.mock import patch
 from openevent.cmd_sdk.model import CmdKillRequest, CmdRunRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import CommandRunner, now_ms
-from openevent.cmd_worker.worker import CmdWorker, KillEvent, RunEvent
+from openevent.cmd_worker.worker import ActiveRun, CmdWorker, KillEvent, RunEvent
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "WNOWAIT"), "requires Linux waitid")
@@ -197,7 +197,7 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
             self.assertIsNone(task.kill_reason)
         self.assertEqual(os.waitstatus_to_exitcode(self._reap_child(child)), -signal.SIGKILL)
 
-    def test_worker_kill_after_shell_exit_preserves_failure_and_reports_finished(self):
+    def test_worker_kill_after_shell_exit_preserves_failure_and_reports_not_running(self):
         task, child = self._start('sleep 30 & printf "%s\\n" "$!"; exit 7')
         self._observe_leader_exit(task)
         self._assert_child_running(child)
@@ -211,8 +211,7 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
         event = RunEvent(task.seq, 2001, 1001, timestamp, CmdRunRequest(
             command=task.process.args, timeout_ms=30000, ts_ms=timestamp,
         ))
-        worker.requests[(2001, task.seq)] = event
-        worker.running[(2001, task.seq)] = task
+        worker.running[(2001, task.seq)] = ActiveRun(event, task)
         records = []
 
         def record(channel_id, request_principal, result):
@@ -224,11 +223,11 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
             10, 2001, 1001, CmdKillRequest(target_seq=task.seq, ts_ms=timestamp),
         ))
 
-        self.assertEqual([result.status for result in records], ["FAILED", "ALREADY_FINISHED"])
+        self.assertEqual([result.status for result in records], ["FAILED", "NOT_RUNNING"])
         self.assertEqual(records[0].exit_code, 7)
         self.assertIsNone(task.kill_reason)
         self.assertFalse(worker.running)
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
         self.assertEqual(os.waitstatus_to_exitcode(self._reap_child(child)), -signal.SIGKILL)
 
     def test_kill_and_timeout_clean_group_and_preserve_first_reason(self):
@@ -262,7 +261,11 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
             output_dir=self.runner.output_dir,
         ), object())
         worker.runner = self.runner
-        worker.running = {(task.channel_id, task.seq): task for task in (exited, running)}
+        for task in (exited, running):
+            event = RunEvent(task.seq, task.channel_id, 1001, task.started_at_ms, CmdRunRequest(
+                command=task.process.args, timeout_ms=30000, ts_ms=task.started_at_ms,
+            ))
+            worker.running[(task.channel_id, task.seq)] = ActiveRun(event, task)
 
         worker.stop()
 

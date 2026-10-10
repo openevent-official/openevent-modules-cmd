@@ -8,9 +8,14 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openevent.sdk.proto import openevent_pb2
 
 import grpc
 
@@ -49,6 +54,13 @@ class RunEvent:
     principal: int
     server_ts_ms: int
     request: CmdRunRequest
+    object_keys: tuple[openevent_pb2.ObjectKey, ...] = ()
+
+
+@dataclass(frozen=True)
+class ActiveRun:
+    request: RunEvent
+    command: RunningCommand
 
 
 @dataclass(frozen=True)
@@ -107,9 +119,7 @@ class CmdWorker:
         )
         self.next_fetch_seq = 1
         self.pending: OrderedDict[tuple[int, int], RunEvent] = OrderedDict()
-        self.running: dict[tuple[int, int], RunningCommand] = {}
-        self.requests: dict[tuple[int, int], RunEvent] = {}
-        self.finished_runs: set[tuple[int, int]] = set()
+        self.running: dict[tuple[int, int], ActiveRun] = {}
         self.completions: Queue[CompletionEvent] = Queue()
         self.stopping = False
         self.starting_command = False
@@ -147,46 +157,53 @@ class CmdWorker:
     def _scan_history(self) -> _RecoveryState:
         recovery = _RecoveryState()
         self.next_fetch_seq = 1
-        response = self._fetch_with_retries(self.next_fetch_seq)
-        recovery_last_seq = int(response.last_seq)
-        while True:
-            for message in response.messages:
-                if int(message.seq) > recovery_last_seq:
-                    continue
-                event = self._observe_message(message, recovery=recovery)
-                if event is not None:
-                    recovery.requests[(event.channel_id, event.seq)] = event
-            next_seq = min(int(response.next_seq), recovery_last_seq + 1)
-            if next_seq <= self.next_fetch_seq and self.next_fetch_seq <= recovery_last_seq:
-                raise RuntimeError("Fetch did not advance next_seq")
-            self.next_fetch_seq = next_seq
-            if self.next_fetch_seq > recovery_last_seq:
-                break
-            response = self._fetch_with_retries(self.next_fetch_seq)
+
+        def observe(message: openevent_pb2.EventMessage) -> None:
+            event = self._observe_message(message, recovery=recovery)
+            if event is not None:
+                recovery.requests[(event.channel_id, event.seq)] = event
+
+        self._consume_pages(observe)
         return recovery
 
     def _fetch_round(self) -> tuple[bool, bool]:
         """Consume pages through one fixed boundary before scheduling new runs."""
-        observed = False
         completed = False
+
+        def after_page() -> None:
+            nonlocal completed
+            completed = self._drain_completions() or completed
+
+        observed = self._consume_pages(self._observe_realtime_message, after_page=after_page)
+        return observed, completed
+
+    def _consume_pages(
+        self,
+        on_message: Callable[[openevent_pb2.EventMessage], None],
+        *,
+        after_page: Callable[[], None] | None = None,
+    ) -> bool:
+        """Consume through the first page's tail, releasing each page before proceeding."""
+        observed = False
         response = self._fetch_with_retries(self.next_fetch_seq)
-        round_last_seq = int(response.last_seq)
+        last_seq = int(response.last_seq)
         while True:
             for message in response.messages:
-                if int(message.seq) <= round_last_seq:
-                    self._observe_realtime_message(message)
+                if int(message.seq) <= last_seq:
+                    on_message(message)
                     observed = True
-            next_seq = min(int(response.next_seq), round_last_seq + 1)
-            if next_seq <= self.next_fetch_seq and self.next_fetch_seq <= round_last_seq:
+            next_seq = min(int(response.next_seq), last_seq + 1)
+            if next_seq <= self.next_fetch_seq and self.next_fetch_seq <= last_seq:
                 raise RuntimeError("Fetch did not advance next_seq")
             self.next_fetch_seq = next_seq
             # Release this page, including the loop's last message, before
-            # publishing completions or fetching another potentially large page.
+            # invoking the page callback or fetching another potentially large page.
             message = None
             del response
-            completed = self._drain_completions() or completed
-            if self.next_fetch_seq > round_last_seq:
-                return observed, completed
+            if after_page is not None:
+                after_page()
+            if self.next_fetch_seq > last_seq:
+                return observed
             response = self._fetch_with_retries(self.next_fetch_seq)
 
     def _fetch_with_retries(self, from_seq: int):
@@ -225,8 +242,6 @@ class CmdWorker:
                 recovery.accepted.add((channel_id, payload.prev_seq))
             return None
         if isinstance(payload, (CmdRunResult, CmdKillResult, CmdOutputReadResult)):
-            if isinstance(payload, CmdRunResult):
-                self._record_run_result(channel_id, payload.prev_seq)
             if recovery is not None:
                 # Close just this request, including ones from earlier pages;
                 # never rescan the accumulated history to release its payload.
@@ -235,7 +250,7 @@ class CmdWorker:
                     recovery.accepted.discard((channel_id, payload.prev_seq))
             return None
         if isinstance(payload, CmdRunRequest):
-            return RunEvent(parsed.seq, parsed.channel_id, parsed.principal, int(message.ts_ms), payload)
+            return RunEvent(parsed.seq, parsed.channel_id, parsed.principal, int(message.ts_ms), payload, parsed.object_keys)
         if isinstance(payload, CmdKillRequest):
             return KillEvent(parsed.seq, parsed.channel_id, parsed.principal, payload)
         if isinstance(payload, CmdOutputReadRequest):
@@ -260,9 +275,6 @@ class CmdWorker:
             self._handle_invalid_request_event(event)
 
     def _handle_run_event(self, event: RunEvent) -> None:
-        if self._has_run_result(event.channel_id, event.seq):
-            return
-        self.requests[(event.channel_id, event.seq)] = event
         self.pending[(event.channel_id, event.seq)] = event
 
     def _drain_pending(self) -> bool:
@@ -270,8 +282,6 @@ class CmdWorker:
         while not self.stopping and self.pending and len(self.running) < self.config.max_concurrent_tasks:
             _, event = self.pending.popitem(last=False)
             handled = True
-            if self._has_run_result(event.channel_id, event.seq):
-                continue
             self._start_or_timeout(event)
         return handled
 
@@ -293,11 +303,14 @@ class CmdWorker:
             if self.stopping:
                 return
             try:
-                task = self.runner.start(event.channel_id, event.seq, event.request.command, event.request.workdir, timeout_ms, deadline_ms)
+                task = self.runner.start(
+                    event.channel_id, event.seq, event.request.command, event.request.workdir,
+                    timeout_ms, deadline_ms, object_keys=event.object_keys,
+                )
             except CommandStartError as exc:
                 start_error = exc
             else:
-                self.running[(event.channel_id, event.seq)] = task
+                self.running[(event.channel_id, event.seq)] = ActiveRun(event, task)
         finally:
             self.starting_command = False
         if self.stopping:
@@ -335,48 +348,45 @@ class CmdWorker:
                 raise RuntimeError(
                     f"failed to wait for command channel_id={event.channel_id} seq={event.seq}"
                 ) from event.error
-            task = self.running.get((event.channel_id, event.seq))
-            if task is not None:
-                self._finish_task(task, event.return_code)
+            active = self.running.get((event.channel_id, event.seq))
+            if active is not None:
+                self._finish_task(active, event.return_code)
 
-    def _finish_task(self, task: RunningCommand, return_code: int) -> None:
+    def _finish_task(self, active: ActiveRun, return_code: int) -> None:
+        task = active.command
         key = (task.channel_id, task.seq)
-        run_event = self.requests.get(key)
-        if run_event is not None and not self._has_run_result(task.channel_id, task.seq):
-            with task.termination_lock:
-                reason = task.kill_reason
-            status = reason or ("SUCCESS" if return_code == 0 else "FAILED")
-            self._publish_run_result(
-                run_event, status, timeout_ms=task.timeout_ms,
-                started_at_ms=task.started_at_ms,
-                exit_code=return_code if reason is None else None,
-            )
+        with task.termination_lock:
+            reason = task.kill_reason
+        status = reason or ("SUCCESS" if return_code == 0 else "FAILED")
+        self._publish_run_result(
+            active.request, status, timeout_ms=task.timeout_ms,
+            started_at_ms=task.started_at_ms,
+            exit_code=return_code if reason is None else None,
+        )
         self.running.pop(key, None)
 
     def _handle_kill_event(self, event: KillEvent) -> None:
         target_key = (event.channel_id, event.request.target_seq)
-        task = self.running.get(target_key)
-        if task is not None:
+        active = self.running.get(target_key)
+        if active is not None:
+            task = active.command
             return_code = self.runner.poll(task)
             if return_code is not None:
-                self._finish_task(task, return_code)
-                self._publish_kill_result(event, "ALREADY_FINISHED")
+                self._finish_task(active, return_code)
+                self._publish_kill_result(event, "NOT_RUNNING")
                 return
             if self.runner.terminate(task, "KILLED"):
                 self._publish_kill_result(event, "KILL_SENT")
             else:
-                self._finish_task(task, self.runner.wait(task))
-                self._publish_kill_result(event, "ALREADY_FINISHED")
+                self._finish_task(active, self.runner.wait(task))
+                self._publish_kill_result(event, "NOT_RUNNING")
             return
         pending = self.pending.pop(target_key, None)
         if pending is not None:
             self._publish_run_result(pending, "KILLED", timeout_ms=pending.request.timeout_ms or self.config.default_timeout_ms)
             self._publish_kill_result(event, "REMOVED_PENDING")
             return
-        if self._has_run_result(event.channel_id, event.request.target_seq):
-            self._publish_kill_result(event, "ALREADY_FINISHED")
-            return
-        self._publish_kill_result(event, "NOT_FOUND")
+        self._publish_kill_result(event, "NOT_RUNNING")
 
     def _handle_output_read_event(self, event: OutputReadEvent) -> None:
         result = self._build_output_read_result(event)
@@ -422,7 +432,7 @@ class CmdWorker:
             return CmdOutputReadResultInput(status="READ_FAILED", bytes=0, eof=False, content_encoding="utf-8", content="", error_message=_error_text(str(exc)), **base)
 
     def _handle_invalid_request_event(self, event: InvalidRequestEvent) -> None:
-        if event.kind == KIND_RUN_REQUEST and not self._has_run_result(event.channel_id, event.seq):
+        if event.kind == KIND_RUN_REQUEST:
             output_file = f"{event.channel_id}/{event.seq}"
             result = CmdRunResultInput(
                 prev_seq=event.seq,
@@ -433,7 +443,6 @@ class CmdWorker:
                 error_message=_error_text(event.error_message),
             )
             self.publisher.publish_run_result(event.channel_id, event.principal, result)
-            self._record_run_result(event.channel_id, event.seq)
         elif event.kind == KIND_KILL_REQUEST:
             target_seq = _best_effort_int(event.payload, "target_seq")
             result = CmdKillResultInput(prev_seq=event.seq, target_seq=target_seq, status="REJECTED", error_message=_error_text(event.error_message))
@@ -457,9 +466,10 @@ class CmdWorker:
 
     def _publish_recovery_failed(self, event: RunEvent) -> None:
         timeout_ms = event.request.timeout_ms or self.config.default_timeout_ms
-        result = self._run_result_input(event, "RECOVERY_FAILED", timeout_ms=timeout_ms, error_message="worker recovered accepted run request without final result")
-        self.publisher.publish_run_result(event.channel_id, event.principal, result)
-        self._record_run_result(event.channel_id, event.seq)
+        self._publish_run_result(
+            event, "RECOVERY_FAILED", timeout_ms=timeout_ms,
+            error_message="worker recovered accepted run request without final result",
+        )
 
     def _publish_run_result(
         self,
@@ -472,7 +482,6 @@ class CmdWorker:
     ) -> None:
         result = self._run_result_input(event, status, timeout_ms=timeout_ms, started_at_ms=started_at_ms, exit_code=exit_code, error_message=error_message)
         self.publisher.publish_run_result(event.channel_id, event.principal, result)
-        self._record_run_result(event.channel_id, event.seq)
 
     def _run_result_input(
         self,
@@ -501,16 +510,8 @@ class CmdWorker:
         result = CmdKillResultInput(prev_seq=event.seq, target_seq=event.request.target_seq, status=status, error_message=_error_text(error_message) if error_message else None)
         self.publisher.publish_kill_result(event.channel_id, event.principal, result)
 
-    def _record_run_result(self, channel_id: int, prev_seq: int) -> None:
-        key = (channel_id, prev_seq)
-        self.finished_runs.add(key)
-        self.requests.pop(key, None)
-
-    def _has_run_result(self, channel_id: int, prev_seq: int) -> bool:
-        return (channel_id, prev_seq) in self.finished_runs
-
     def _kill_all_running(self) -> None:
-        tasks = list(self.running.values())
+        tasks = [active.command for active in self.running.values()]
         for task in tasks:
             self.runner.terminate(task, "KILLED")
         for task in tasks:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Iterable
+
+if TYPE_CHECKING:
+    from openevent.sdk.proto import openevent_pb2
 
 from .codec import (
     dict_to_model, dumps_payload, loads_payload,
@@ -18,17 +22,20 @@ from .model import (
 class CmdProtocolClient:
     openevent_client: object
 
-    def _publish(self, principal, token, channel_id, data, recipients, uuid):
+    def _publish(self, principal, token, channel_id, data, recipients, uuid, object_keys=()):
         payload = dumps_payload(data)
         if uuid is None:
             uuid = self.openevent_client.get_uuid()
         return int(self.openevent_client.publish_auto_seq(
             principal=principal, token=token, channel_id=channel_id,
-            recipients=recipients, payload=payload, uuid=uuid,
+            recipients=recipients, payload=payload, uuid=uuid, object_keys=object_keys,
         ).seq)
 
-    def publish_run_request(self, principal: int, token: str, channel_id: int, req: CmdRunRequestInput, *, uuid: int | None = None) -> int:
-        return self._publish(principal, token, channel_id, run_request_input_to_dict(req), [], uuid)
+    def publish_run_request(
+        self, principal: int, token: str, channel_id: int, req: CmdRunRequestInput, *,
+        object_keys: Iterable[openevent_pb2.ObjectKey] = (), uuid: int | None = None,
+    ) -> int:
+        return self._publish(principal, token, channel_id, run_request_input_to_dict(req), [], uuid, object_keys)
 
     def publish_kill_request(self, principal: int, token: str, channel_id: int, req: CmdKillRequestInput, *, uuid: int | None = None) -> int:
         return self._publish(principal, token, channel_id, kill_request_input_to_dict(req), [], uuid)
@@ -59,4 +66,5 @@ def parse_message(message) -> ParsedMessage:
         seq=int(message.seq), channel_id=int(message.channel_id),
         principal=int(message.principal),
         recipients=tuple(int(value) for value in message.recipients), payload=payload,
+        object_keys=tuple(message.object_keys),
     )

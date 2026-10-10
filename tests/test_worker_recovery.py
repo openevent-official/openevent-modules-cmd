@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from openevent.cmd_sdk.model import KIND_KILL_RESULT, KIND_OUTPUT_READ_RESULT, KIND_RUN_RESULT
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
-from openevent.cmd_worker.worker import CmdWorker, InvalidRequestEvent
+from openevent.cmd_worker.worker import CmdWorker, CompletionEvent, InvalidRequestEvent
 
 from test_worker_lifecycle import FakeClient, RecordingPublisher, message
 
@@ -48,7 +48,7 @@ class WorkerRecoveryTest(unittest.TestCase):
         worker.resolver.validate_startup()
         recovery = worker._scan_history()
         self.assertEqual([event.seq for event in recovery.requests.values()], [2, 5])
-        self.assertTrue(worker._has_run_result(2001, 1))
+        self.assertNotIn((2001, 1), recovery.requests)
         self.assertFalse(recovery.accepted)
         self.assertEqual(worker.next_fetch_seq, 6)
         self.assertEqual(worker._fetch_round(), (True, False))
@@ -64,8 +64,25 @@ class WorkerRecoveryTest(unittest.TestCase):
         ])
         worker = CmdWorker(self.config, client)
         worker.resolver.validate_startup()
+        completion = CompletionEvent(2001, 99, 0)
+        worker.completions.put(completion)
         self.assertEqual([event.seq for event in worker._scan_history().requests.values()], [5])
         self.assertEqual(worker.next_fetch_seq, 6)
+        self.assertIs(worker.completions.get_nowait(), completion)
+
+    def test_nonadvancing_page_fails_on_first_or_later_recovery_page(self):
+        for stalled_seq in (1, 2):
+            with self.subTest(stalled_seq=stalled_seq):
+                client = FakeClient()
+                worker = CmdWorker(self.config, client)
+                pages = []
+                if stalled_seq == 2:
+                    pages.append(SimpleNamespace(messages=[], next_seq=2, last_seq=2))
+                pages.append(SimpleNamespace(messages=[], next_seq=stalled_seq, last_seq=2))
+                client.fetch = Mock(side_effect=pages)
+
+                with self.assertRaisesRegex(RuntimeError, "Fetch did not advance next_seq"):
+                    worker._scan_history()
 
     def test_scan_closes_all_request_kinds_across_pages_and_channels(self):
         def item(seq, channel_id, payload, principal=1001):
@@ -89,7 +106,7 @@ class WorkerRecoveryTest(unittest.TestCase):
             item(9, 2003, run),
             item(10, 2001, _run_result(1, 2001, "START_FAILED"), 30001),
             item(11, 2002, {"kind": KIND_KILL_RESULT, "prev_seq": 2,
-                           "target_seq": 99, "status": "NOT_FOUND"}, 30001),
+                           "target_seq": 99, "status": "NOT_RUNNING"}, 30001),
             item(12, 2001, {"kind": KIND_OUTPUT_READ_RESULT, "prev_seq": 3,
                            "target_seq": 99, "stream": "stdout", "offset": 0, "nbytes": 10,
                            "status": "NOT_FOUND", "content": "", "bytes": 0,
@@ -115,7 +132,8 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual([(event.channel_id, event.seq) for event in events],
                          [(2002, 5), (2001, 6), (2002, 7), (2001, 8)])
         self.assertIsInstance(events[-1], InvalidRequestEvent)
-        self.assertEqual(worker.finished_runs, {(2001, 1), (2002, 4)})
+        self.assertFalse(worker.pending)
+        self.assertFalse(worker.running)
         self.assertFalse(recovery.accepted)
         self.assertEqual(worker.next_fetch_seq, 14)
 
@@ -149,7 +167,7 @@ class WorkerRecoveryTest(unittest.TestCase):
                 return SimpleNamespace(messages=[
                     message(5, {"ts_ms": 1000, **_run_result(1, 2001, "START_FAILED")}, 30001),
                     message(6, {"kind": KIND_KILL_RESULT, "ts_ms": 1000, "prev_seq": 3,
-                                "target_seq": 1, "status": "ALREADY_FINISHED"}, 30001),
+                                "target_seq": 1, "status": "NOT_RUNNING"}, 30001),
                     message(7, {"kind": KIND_OUTPUT_READ_RESULT, "ts_ms": 1000, "prev_seq": 4,
                                 "target_seq": 1, "stream": "stdout", "offset": 0, "nbytes": 10,
                                 "status": "NOT_FOUND", "content": "", "bytes": 0,
@@ -172,7 +190,8 @@ class WorkerRecoveryTest(unittest.TestCase):
 
         self.assertEqual([event.seq for event in recovery.requests.values()], [8, 9])
         self.assertEqual(recovery.accepted, {(2001, 9)})
-        self.assertEqual(worker.finished_runs, {(2001, 1)})
+        self.assertFalse(worker.pending)
+        self.assertFalse(worker.running)
 
     def test_startup_replays_in_order_and_releases_recovery_state_before_starting(self):
         client = FakeClient([
@@ -206,7 +225,8 @@ class WorkerRecoveryTest(unittest.TestCase):
             worker.startup()
 
         start_command.assert_called_once()
-        self.assertEqual(worker.finished_runs, {(2001, 1), (2001, 3)})
+        self.assertFalse(worker.pending)
+        self.assertFalse(worker.running)
 
     def test_recovery_uses_current_default_only_when_request_omits_timeout(self):
         for requested, expected in ((None, 600000), (10000, 10000)):

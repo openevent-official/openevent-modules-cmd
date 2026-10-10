@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from openevent.cmd_sdk import (
+    CmdKillResultInput,
     CmdOutput,
     CmdOutputReadRequestInput,
     CmdOutputReadResultInput,
@@ -18,7 +19,7 @@ from openevent.cmd_sdk import (
     parse_message,
 )
 from openevent.cmd_sdk import codec
-from openevent.cmd_sdk.codec import output_read_request_input_to_dict, output_read_result_input_to_dict, run_request_input_to_dict, run_result_input_to_dict
+from openevent.cmd_sdk.codec import kill_result_input_to_dict, output_read_request_input_to_dict, output_read_result_input_to_dict, run_request_input_to_dict, run_result_input_to_dict
 from openevent.cmd_sdk.model import MAX_TIMEOUT_MS
 
 
@@ -84,6 +85,42 @@ class CmdSDKTest(unittest.TestCase):
                 "nbytes": 4096,
             },
         )
+
+    def test_kill_result_round_trip_uses_current_statuses(self) -> None:
+        for status in ("KILL_SENT", "REMOVED_PENDING", "NOT_RUNNING", "REJECTED"):
+            with self.subTest(status=status):
+                result = CmdKillResultInput(
+                    prev_seq=2, target_seq=1, status=status, ts_ms=123,
+                    error_message="bad request" if status == "REJECTED" else None,
+                )
+                data = kill_result_input_to_dict(result)
+                self.assertEqual(loads_payload(dumps_payload(data)), data)
+                parsed = parse_message(SimpleNamespace(
+                    seq=3, channel_id=2001, principal=30001, recipients=[1001],
+                    object_keys=[], payload=dumps_payload(data),
+                ))
+                self.assertEqual(parsed.payload.status, status)
+                self.assertEqual(parsed.payload.target_seq, 1)
+
+    def test_kill_result_rejects_removed_statuses(self) -> None:
+        for status in ("ALREADY_FINISHED", "NOT_FOUND"):
+            with self.subTest(status=status):
+                data = kill_result_input_to_dict(CmdKillResultInput(
+                    prev_seq=2, target_seq=1, status=status, ts_ms=123,
+                ))
+                with self.assertRaises(CmdSDKError):
+                    dumps_payload(data)
+                with self.assertRaises(CmdSDKError):
+                    loads_payload(json.dumps(data).encode("utf-8"))
+
+    def test_output_read_still_accepts_not_found(self) -> None:
+        result = CmdOutputReadResultInput(
+            prev_seq=2, target_seq=1, stream="stdout", offset=0, nbytes=1,
+            status="NOT_FOUND", bytes=0, eof=True, content_encoding="utf-8",
+            content="", ts_ms=123,
+        )
+        data = output_read_result_input_to_dict(result)
+        self.assertEqual(loads_payload(dumps_payload(data)), data)
 
     def test_run_result_requires_error_message_for_recovery_failed(self) -> None:
         result = CmdRunResultInput(
@@ -151,6 +188,7 @@ class CmdSDKTest(unittest.TestCase):
         )
         message = SimpleNamespace(
             seq=11, channel_id=2001, principal=30001, recipients=[1001],
+            object_keys=[],
             payload=dumps_payload(output_read_result_input_to_dict(result)),
         )
         with patch.object(codec, "validate_payload_dict", wraps=codec.validate_payload_dict) as validate:

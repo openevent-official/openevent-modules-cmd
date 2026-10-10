@@ -66,9 +66,9 @@ any failure stops startup.
 - Output is written under `output_dir/<channel_id>/`, without automatic cleanup or
   file size limits. Cleanup and capacity protection are deployment responsibilities.
 - When concurrency is full, the worker continues consuming messages into an
-  in-memory queue. The pending queue, unresolved requests during recovery scanning,
-  and completed run identifiers have no total size limit. Completed kill and output
-  read records, and run accepted records, are not retained long-term.
+  in-memory queue. The pending queue and unresolved requests during recovery scanning
+  have no total size limit. The worker does not keep completed task identifiers or
+  request records in memory.
 
 ## Task Process Lifecycle
 

@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-OpenEvent Cmd 模块提供 `cmd.v1` 协议 SDK 和 Linux 命令 worker：通过消息运行或终止命令，
+OpenEvent Cmd 模块提供 `cmd.v2` 协议 SDK 和 Linux 命令 worker：通过消息运行或终止命令，
 把 stdout/stderr 保存到本地文件，写回结果，并支持按字节范围查询输出。
 
 ## 运行前提
@@ -23,6 +23,7 @@ make check-docs
 
 用 `PYTHON=/path/to/venv/bin/python` 选择安装和测试环境。`make install` 构建并替换本项目包，
 版本相同也会替换；只补齐缺失或版本不符的依赖。只构建时运行 `make build`。
+`make install` 和 `make e2e` 均可通过 `INSTALL_ARGS=--user` 使用用户目录安装。
 
 `make test` 运行单元及安装回归测试。端到端测试需要本次成功构建的 OpenEvent server：
 

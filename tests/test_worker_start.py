@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
+import shlex
+import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -9,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from openevent.cmd_sdk.model import CmdRunRequest
+from openevent.cmd_sdk.codec import dumps_payload
+from openevent.sdk.proto import openevent_pb2
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import now_ms
 from openevent.cmd_worker.worker import CmdWorker, RunEvent
@@ -52,6 +57,47 @@ class WorkerStartTest(unittest.TestCase):
     def test_nul_workdir_returns_start_failed_and_allows_next_command(self):
         self.assert_start_failure_then_success(self.root / "nul\0directory")
 
+    def test_request_object_keys_reach_each_child_without_changing_worker_environment(self):
+        keys = [
+            openevent_pb2.ObjectKey(object_id=2**63 + 7, object_token='token-"one"'),
+            openevent_pb2.ObjectKey(object_id=23, object_token="token-two"),
+        ]
+        code = 'import os; print(os.environ["OPENEVENT_OBJECT_KEYS"])'
+        child = f"{shlex.quote(sys.executable)} -B -c {shlex.quote(code)}"
+        command = f"{child}; {child}"
+        for recovered in (False, True):
+            for attachments in (keys, []):
+                with self.subTest(recovered=recovered, attachments=bool(attachments)):
+                    timestamp = now_ms()
+                    message = openevent_pb2.EventMessage(
+                        seq=1, channel_id=2001, principal=1001, ts_ms=timestamp,
+                        object_keys=attachments,
+                        payload=dumps_payload({
+                            "kind": "cmd.run.request", "command": command,
+                            "ts_ms": timestamp, "timeout_ms": 30000,
+                        }),
+                    )
+                    worker = CmdWorker(self.config, FakeClient([message] if recovered else []))
+                    worker.publisher = RecordingPublisher()
+                    self.addCleanup(worker.stop)
+                    with patch.dict(os.environ, {"OPENEVENT_OBJECT_KEYS": "inherited-value"}):
+                        if recovered:
+                            worker.startup()
+                        else:
+                            worker._observe_realtime_message(message)
+                        worker._drain_pending()
+                        completion = worker.completions.get(timeout=5)
+                        worker.completions.put(completion)
+                        worker._drain_completions()
+                        self.assertEqual(os.environ["OPENEVENT_OBJECT_KEYS"], "inherited-value")
+                    result = worker.publisher.records[-1]
+                    self.assertEqual(result["status"], "SUCCESS")
+                    expected = [{"object_id": key.object_id, "object_token": key.object_token}
+                                for key in attachments]
+                    reads = [json.loads(line) for line in result["stdout"]["content"].splitlines()]
+                    self.assertEqual(reads, [expected, expected])
+                    worker.stop()
+
     def assert_start_failure_then_success(self, workdir, start_context=None, *, command="printf hello"):
         worker = CmdWorker(self.config, FakeClient())
         worker.publisher = RecordingPublisher()
@@ -72,7 +118,7 @@ class WorkerStartTest(unittest.TestCase):
         self.assertNotIn("started_at_ms", result)
         self.assertNotIn("exit_code", result)
         self.assertFalse(worker.running)
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
         self.assertFalse(worker.starting_command)
         self.assertFalse(worker.stopping)
 
@@ -87,7 +133,7 @@ class WorkerStartTest(unittest.TestCase):
         )
         self.assertEqual(worker.publisher.records[-1]["stdout"]["content"], "hello")
         self.assertFalse(worker.running)
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
 
 
 if __name__ == "__main__":

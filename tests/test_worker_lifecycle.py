@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from openevent.cmd_sdk.codec import (
 from openevent.cmd_sdk.model import CmdKillRequest, CmdOutputReadRequest, CmdRunRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import RunningCommand
-from openevent.cmd_worker.worker import CmdWorker, KillEvent, OutputReadEvent, RunEvent
+from openevent.cmd_worker.worker import ActiveRun, CmdWorker, CompletionEvent, KillEvent, OutputReadEvent, RunEvent
 from openevent.sdk.proto import openevent_pb2
 
 
@@ -28,6 +29,7 @@ def message(seq: int, payload: dict, principal: int = 1001):
         channel_id=2001,
         principal=principal,
         recipients=[] if principal == 1001 else [1001],
+        object_keys=[],
         ts_ms=1000,
         payload=dumps_payload(payload),
     )
@@ -39,7 +41,7 @@ class FakeClient:
 
     def get_channel(self, principal, token, channel_id):
         return SimpleNamespace(channel=SimpleNamespace(
-            protocol="cmd.v1",
+            protocol="cmd.v2",
             visibility=openevent_pb2.VISIBILITY_PRIVATE,
             members=[principal],
             description="Command execution",
@@ -133,8 +135,8 @@ class WorkerLifecycleTest(unittest.TestCase):
     def kill_event(self, seq=2):
         return KillEvent(seq, 2001, 1001, CmdKillRequest(target_seq=1, ts_ms=1001))
 
-    def running_task(self, worker, returncode=None):
-        event = self.run_event()
+    def running_task(self, worker, returncode=None, seq=1):
+        event = self.run_event(seq=seq)
         task = RunningCommand(
             channel_id=2001,
             seq=event.seq,
@@ -143,8 +145,7 @@ class WorkerLifecycleTest(unittest.TestCase):
             timeout_ms=1000,
             deadline_ms=2000,
         )
-        worker.requests[(2001, event.seq)] = event
-        worker.running[(2001, event.seq)] = task
+        worker.running[(2001, event.seq)] = ActiveRun(event, task)
         return task
 
     def test_pending_cancel_persists_target_result_before_kill_result(self):
@@ -157,7 +158,7 @@ class WorkerLifecycleTest(unittest.TestCase):
             [("cmd.run.result", "KILLED"), ("cmd.kill.result", "REMOVED_PENDING")],
         )
         self.assertFalse(worker.pending)
-        self.assertNotIn((2001, 1), worker.requests)
+        self.assertFalse(worker.running)
 
     def test_pending_cancel_preserves_channel_scope_and_remaining_fifo_order(self):
         self.config = replace(self.config, channel_ids=(2001, 2002))
@@ -171,7 +172,7 @@ class WorkerLifecycleTest(unittest.TestCase):
         # channel 2001 must leave every queued request in place.
         request = CmdKillRequest(target_seq=2, ts_ms=1001)
         worker._handle_kill_event(KillEvent(5, 2001, 1001, request))
-        self.assertEqual(worker.publisher.records[-1]["status"], "NOT_FOUND")
+        self.assertEqual(worker.publisher.records[-1]["status"], "NOT_RUNNING")
         self.assertEqual(len(worker.pending), 4)
         worker._handle_kill_event(KillEvent(6, 2002, 1001, request))
         self.assertEqual(
@@ -183,7 +184,7 @@ class WorkerLifecycleTest(unittest.TestCase):
             self.assertTrue(worker._drain_pending())
         self.assertEqual([call.args[0] for call in start.call_args_list], [events[0], events[2], events[3]])
         self.assertFalse(worker.pending)
-        self.assertNotIn((2002, 2), worker.requests)
+        self.assertFalse(worker.running)
 
     def test_restart_between_cancel_results_does_not_restart_target(self):
         worker = self.worker()
@@ -205,11 +206,10 @@ class WorkerLifecycleTest(unittest.TestCase):
         recovered.runner.start.assert_not_called()
         self.assertEqual(
             [(item["kind"], item["status"]) for item in recovered.publisher.records],
-            [("cmd.kill.result", "ALREADY_FINISHED")],
+            [("cmd.kill.result", "NOT_RUNNING")],
         )
         self.assertFalse(recovered.pending)
-        self.assertFalse(recovered.requests)
-        self.assertTrue(recovered._has_run_result(2001, 1))
+        self.assertFalse(recovered.running)
 
     def test_accepted_delay_past_deadline_does_not_start_command(self):
         worker = self.worker()
@@ -224,7 +224,8 @@ class WorkerLifecycleTest(unittest.TestCase):
         self.assertEqual([item["kind"] for item in worker.publisher.records], ["cmd.run.accepted", "cmd.run.result"])
         self.assertEqual(worker.publisher.records[-1]["status"], "TIMEOUT")
         self.assertNotIn("started_at_ms", worker.publisher.records[-1])
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
+        self.assertFalse(worker.running)
 
     def test_second_kill_preserves_killed_status_before_completion_is_drained(self):
         worker = self.worker()
@@ -237,11 +238,11 @@ class WorkerLifecycleTest(unittest.TestCase):
 
         self.assertEqual(
             [(item["kind"], item["status"]) for item in worker.publisher.records],
-            [("cmd.kill.result", "KILL_SENT"), ("cmd.run.result", "KILLED"), ("cmd.kill.result", "ALREADY_FINISHED")],
+            [("cmd.kill.result", "KILL_SENT"), ("cmd.run.result", "KILLED"), ("cmd.kill.result", "NOT_RUNNING")],
         )
         self.assertNotIn("exit_code", worker.publisher.records[1])
         self.assertFalse(worker.running)
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
 
     def test_kill_after_timeout_preserves_timeout_status(self):
         worker = self.worker()
@@ -259,12 +260,13 @@ class WorkerLifecycleTest(unittest.TestCase):
 
         self.assertEqual(
             [(item["kind"], item["status"]) for item in worker.publisher.records],
-            [("cmd.run.result", "TIMEOUT"), ("cmd.kill.result", "ALREADY_FINISHED")],
+            [("cmd.run.result", "TIMEOUT"), ("cmd.kill.result", "NOT_RUNNING")],
         )
         self.assertNotIn("exit_code", worker.publisher.records[0])
-        self.assertFalse(worker.requests)
+        self.assertFalse(worker.pending)
+        self.assertFalse(worker.running)
 
-    def test_completion_releases_request_but_remembers_finished_run(self):
+    def test_completion_releases_request_and_running_task(self):
         worker = self.worker()
         task = self.running_task(worker, returncode=0)
         worker._wait_task(task)
@@ -272,10 +274,99 @@ class WorkerLifecycleTest(unittest.TestCase):
 
         self.assertEqual(worker.publisher.records[-1]["status"], "SUCCESS")
         self.assertFalse(worker.running)
-        self.assertFalse(worker.requests)
-        self.assertTrue(worker._has_run_result(2001, 1))
+        self.assertFalse(worker.pending)
 
-    def test_completed_queries_kills_and_reply_readback_keep_only_finished_runs(self):
+    def test_result_publication_failure_keeps_active_commands_available_for_cleanup(self):
+        worker = self.worker()
+        completed = self.running_task(worker, returncode=0)
+        other = self.running_task(worker, seq=2)
+        active = worker.running[(2001, 1)]
+        worker.publisher.publish_run_result = Mock(side_effect=RuntimeError("cannot persist result"))
+        worker.completions.put(CompletionEvent(2001, 1, 0))
+
+        with self.assertRaisesRegex(RuntimeError, "cannot persist result"):
+            worker._drain_completions()
+
+        self.assertIs(worker.running[(2001, 1)], active)
+        self.assertEqual(active.request.seq, 1)
+        self.assertEqual(set(worker.running), {(2001, 1), (2001, 2)})
+        worker.stop()
+
+        self.assertEqual([call.args for call in worker.runner.terminate.call_args_list],
+                         [(completed, "KILLED"), (other, "KILLED")])
+        self.assertEqual([call.args for call in worker.runner.wait.call_args_list],
+                         [(completed,), (other,)])
+        self.assertEqual(completed.process.returncode, 0)
+        self.assertEqual(other.process.returncode, -9)
+        self.assertFalse(worker.publisher.records)
+
+    def test_completed_and_unknown_targets_both_report_not_running_after_restart(self):
+        worker = self.worker()
+        task = self.running_task(worker, returncode=0)
+        worker._wait_task(task)
+        worker._drain_completions()
+        history = [
+            message(1, {"kind": "cmd.run.request", "ts_ms": 1000, "command": "true"}),
+            message(2, {"kind": "cmd.run.accepted", "ts_ms": 1000, "prev_seq": 1}, 30001),
+            *worker.publisher.messages,
+        ]
+
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                if restart:
+                    worker = self.worker(history)
+                    worker.runner.start = Mock(side_effect=AssertionError("finished command must not restart"))
+                    worker.startup()
+                    worker.runner.start.assert_not_called()
+                    self.assertFalse(worker.publisher.records)
+                start = len(worker.publisher.records)
+                for seq, target_seq in ((101, 1), (102, 999999)):
+                    worker._handle_kill_event(KillEvent(
+                        seq, 2001, 1001, CmdKillRequest(target_seq=target_seq, ts_ms=1001),
+                    ))
+                self.assertEqual(
+                    [(item["kind"], item["status"]) for item in worker.publisher.records[start:]],
+                    [("cmd.kill.result", "NOT_RUNNING"), ("cmd.kill.result", "NOT_RUNNING")],
+                )
+                self.assertFalse(worker.running)
+                self.assertFalse(worker.pending)
+
+    def test_late_duplicate_completion_does_not_publish_again_or_affect_next_run(self):
+        worker = self.worker()
+        self.running_task(worker, returncode=0)
+        completion = CompletionEvent(2001, 1, 0)
+        worker.completions.put(completion)
+        worker._drain_completions()
+        next_task = self.running_task(worker, seq=2)
+
+        worker.completions.put(completion)
+        worker._drain_completions()
+
+        self.assertEqual([(item["prev_seq"], item["status"]) for item in worker.publisher.records],
+                         [(1, "SUCCESS")])
+        self.assertEqual(list(worker.running), [(2001, 2)])
+        self.assertIs(worker.running[(2001, 2)].command, next_task)
+        self.assertEqual(worker.running[(2001, 2)].request.seq, 2)
+
+    def test_many_completed_runs_leave_no_task_history_in_memory(self):
+        worker = self.worker()
+        references = []
+        for seq in range(1, 257):
+            task = self.running_task(worker, returncode=0, seq=seq)
+            references.extend((weakref.ref(task), weakref.ref(worker.running[(2001, seq)].request)))
+            worker.completions.put(CompletionEvent(2001, seq, 0))
+            worker._drain_completions()
+            del task
+            self.assertFalse(worker.running)
+            self.assertFalse(worker.pending)
+
+        self.assertEqual(len(worker.publisher.records), 256)
+        self.assertTrue(all(reference() is None for reference in references))
+        self.assertFalse(hasattr(worker, "finished_runs"))
+        self.assertFalse(hasattr(worker, "requests"))
+        self.assertTrue(worker.completions.empty())
+
+    def test_completed_queries_kills_and_reply_readback_retain_no_task_state(self):
         self.config = replace(self.config, channel_ids=(2001, 2002))
         worker = self.worker()
         worker.resolver.validate_startup()
@@ -291,10 +382,10 @@ class WorkerLifecycleTest(unittest.TestCase):
             worker._handle_event(OutputReadEvent(seq, 2001, 1001, request))
             self.assertEqual(worker.publisher.records[-1]["content"], "hello")
             worker._handle_event(self.kill_event(seq + 1))
-            self.assertEqual(worker.publisher.records[-1]["status"], "ALREADY_FINISHED")
+            self.assertEqual(worker.publisher.records[-1]["status"], "NOT_RUNNING")
 
         # Replies are read back on later Fetch rounds, after local publication
-        # has already recorded the completed run.
+        # has already released the completed run.
         worker._observe_realtime_message(
             message(99, {"kind": "cmd.run.accepted", "prev_seq": 1, "ts_ms": 1000}, 30001)
         )
@@ -302,9 +393,8 @@ class WorkerLifecycleTest(unittest.TestCase):
             worker._observe_realtime_message(item)
         worker._handle_event(KillEvent(66, 2002, 1001, CmdKillRequest(target_seq=1, ts_ms=1001)))
 
-        self.assertEqual(worker.publisher.records[-1]["status"], "NOT_FOUND")
-        self.assertEqual(worker.finished_runs, {(2001, 1)})
-        self.assertFalse(worker.requests)
+        self.assertEqual(worker.publisher.records[-1]["status"], "NOT_RUNNING")
+        self.assertFalse(hasattr(worker, "finished_runs"))
         self.assertFalse(worker.running)
         self.assertFalse(worker.pending)
         self.assertFalse(hasattr(worker, "accepted"))

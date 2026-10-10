@@ -1,10 +1,10 @@
-# Cmd 协议 cmd.v1
+# Cmd 协议 cmd.v2
 
 [English version](CMD_PROTOCOL.md)
 
 ## 1. 通道
 
-cmd 通道必须设置 `protocol="cmd.v1"`，不能使用 public visibility。调用方和 worker principal
+cmd 通道必须设置 `protocol="cmd.v2"`，不能使用 public visibility。调用方和 worker principal
 都必须是通道成员，同一通道同一时刻只能有一个有效 worker 消费。
 
 `description` 是可选的普通说明文字，可以为空；worker 不解析其内容。
@@ -58,6 +58,23 @@ cmd 通道必须设置 `protocol="cmd.v1"`，不能使用 public visibility。�
   缺失时使用处理请求时的当前默认值；[启动恢复](CONFIGURATION_cn.md#恢复与退出)也使用当前配置，
   包括补写 `RECOVERY_FAILED`。
 - 超时截止时间为本条消息的顶层 `EventMessage.ts_ms` 加有效 `timeout_ms`，不能用 payload 的 `ts_ms`。
+
+调用方可以在本条消息的 OpenEvent 顶层 `object_keys` 中附带命令需要的对象读取凭据；它不是 payload 字段。
+worker 把这些凭据交给本次命令的运行环境，命令不需要向调用方回查凭据。具体规则：
+
+- worker 继承自己的进程环境，并为本次 shell 设置 `OPENEVENT_OBJECT_KEYS`。
+- 值为 JSON 数组，顺序与请求一致，每项含整数 `object_id` 和字符串 `object_token`，保留完整 ObjectKey。
+  没有附件时固定设置为 `[]`，覆盖 worker 环境中可能已有的值；不同任务不共享或累计凭据。
+- 该变量随进程环境传给命令及其子进程，可以重复读取；worker 不把凭据拼进 `command`，也不主动输出凭据。
+- 对象服务地址由部署环境提供，Cmd 不负责下载对象或提供附件读取程序。
+- 凭据与其他进程环境共同受操作系统的进程参数、环境大小限制；超过限制而无法启动时返回 `START_FAILED`。
+  其他请求及 accepted/result 不传递任务附件凭据。
+
+例如，两个附件对应的环境变量值为：
+
+```json
+[{"object_id":123,"object_token":"object-token-123"},{"object_id":456,"object_token":"object-token-456"}]
+```
 
 ## 4. `cmd.run.accepted`
 
@@ -152,7 +169,7 @@ stdout 和 stderr 独立使用相同规则：
 - `target_seq` 必填，是正整数，预期指向 `cmd.run.request` 的 OpenEvent `seq`。
 - worker 只终止当前进程内运行中或待执行的任务；待执行任务直接从队列删除。
 - 同一通道的任何成员都可以 kill 该通道内的任务，无须是原提交者。
-  `target_seq` 指向其他通道时返回 `NOT_FOUND`，不跨通道操作。
+  `target_seq` 指向其他通道时返回 `NOT_RUNNING`，不跨通道操作。
 
 ## 7. `cmd.kill.result`
 
@@ -174,16 +191,15 @@ stdout 和 stderr 独立使用相同规则：
 | --- | --- |
 | `KILL_SENT` | 目标 shell 仍在运行，已向任务进程组发送 kill 信号 |
 | `REMOVED_PENDING` | 目标尚未启动，已从队列删除 |
-| `ALREADY_FINISHED` | 目标已有最终运行结果，或 shell 已退出并完成组清理与回收；后一种情形先写运行结果 |
-| `NOT_FOUND` | 没有找到目标任务 |
+| `NOT_RUNNING` | 当前通道没有可终止的运行中或待执行目标，不区分已完成和从未存在 |
 | `REJECTED` | 请求 payload 非法或超过协议/配置限制，未发送 kill |
 
 kill 先触发终止时，运行结果为 `KILLED`；超时已先触发时保留 `TIMEOUT`。
 删除待执行任务时，先确认写入运行结果 `KILLED`，再写 `REMOVED_PENDING`。
-两条结果之间崩溃时，重启后运行请求保持已闭合，未完成的 kill 请求可以返回 `ALREADY_FINISHED`。
+两条结果之间崩溃时，重启后运行请求保持已闭合，未完成的 kill 请求返回 `NOT_RUNNING`。
 
 shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATION_cn.md#任务进程生命周期)完成清理和回收，
-写运行结果，再写 `ALREADY_FINISHED`。运行结果保留已确定的 `TIMEOUT`/`KILLED`；否则按 shell
+写运行结果，再写 `NOT_RUNNING`。运行结果保留已确定的 `TIMEOUT`/`KILLED`；否则按 shell
 退出码写 `SUCCESS`/`FAILED`，清理组内残留进程不改为 `KILLED`。
 
 ## 8. `cmd.output.read.request`
@@ -248,4 +264,5 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 
 ## 10. 版本策略
 
-破坏性变更必须使用新协议，例如 `cmd.v2`。
+本包实现 `cmd.v2`，通道和调用方须使用该协议。
+破坏性变更必须使用新协议，例如 `cmd.v3`。

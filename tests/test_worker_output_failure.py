@@ -45,8 +45,8 @@ class WorkerOutputFailureTest(unittest.TestCase):
             request = CmdRunRequest(command=command, timeout_ms=30000, ts_ms=timestamp)
             worker._handle_run_event(RunEvent(seq, 2001, 1001, timestamp, request))
         worker._drain_pending()
-        completed_task = worker.running[(2001, 1)]
-        other_task = worker.running[(2001, 2)]
+        completed_task = worker.running[(2001, 1)].command
+        other_task = worker.running[(2001, 2)].command
         completion = worker.completions.get(timeout=5)
         self.assertEqual(completion.seq, 1)
         self.assertIsNone(completion.error)
@@ -62,7 +62,8 @@ class WorkerOutputFailureTest(unittest.TestCase):
         self.assertEqual(raised.exception.errno, errno.EIO)
         self.assertEqual([record["kind"] for record in worker.publisher.records],
                          ["cmd.run.accepted", "cmd.run.accepted"])
-        self.assertFalse(worker._has_run_result(2001, 1))
+        self.assertIs(worker.running[(2001, 1)].command, completed_task)
+        self.assertEqual(worker.running[(2001, 1)].request.seq, 1)
         self.assertTrue(worker.stopping)
         self.assertEqual(completed_task.process.returncode, 0)
         self.assertEqual(other_task.process.returncode, -signal.SIGKILL)
@@ -86,7 +87,6 @@ class WorkerOutputFailureTest(unittest.TestCase):
                         worker.run()
                 self.assertEqual(raised.exception.errno, errno.EIO)
                 self.assertFalse(worker.publisher.records)
-                self.assertFalse(worker._has_run_result(2001, 1))
                 self.assertTrue(worker.stopping)
                 worker.runner.start.assert_not_called()
 
@@ -98,7 +98,8 @@ class WorkerOutputFailureTest(unittest.TestCase):
         self.assertEqual(result["status"], "RECOVERY_FAILED")
         self.assertEqual(result["stdout"]["content"], "produced")
         self.assertEqual(result["stdout"]["bytes"], 8)
-        self.assertTrue(recovered._has_run_result(2001, 1))
+        self.assertFalse(recovered.pending)
+        self.assertFalse(recovered.running)
 
 
 if __name__ == "__main__":

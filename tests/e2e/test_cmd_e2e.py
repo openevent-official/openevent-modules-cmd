@@ -16,8 +16,11 @@ import sys
 from threading import Lock
 import time
 import unittest
+from unittest.mock import patch
 
 import grpc
+
+from installed_worker import installed_worker_path
 
 from openevent.cmd_sdk import (
     CmdKillRequestInput, CmdOutputReadRequestInput, CmdRunRequestInput,
@@ -104,7 +107,7 @@ class CmdEndToEndTest(unittest.TestCase):
 
     def setUp(self):
         # An accidental source import would make wheel/entry-point checks useless.
-        self.assertTrue(Path(openevent.cmd_worker.cli.__file__).resolve().is_relative_to(Path(sys.prefix)))
+        self.worker_entry = installed_worker_path(openevent.cmd_worker.cli.__file__)
         self.root = Path(os.environ["OPENEVENT_CMD_E2E_DIR"]) / self._testMethodName
         self.root.mkdir(parents=True)
         self.worker = None
@@ -169,7 +172,7 @@ class CmdEndToEndTest(unittest.TestCase):
     def create_channel(self, name, description=""):
         return self.client.create_channel(
             self.requester, self.token, name,
-            visibility=openevent_pb2.VISIBILITY_PRIVATE, protocol="cmd.v1",
+            visibility=openevent_pb2.VISIBILITY_PRIVATE, protocol="cmd.v2",
             description=description, members=[self.worker_principal],
         ).channel.channel_id
 
@@ -189,7 +192,7 @@ class CmdEndToEndTest(unittest.TestCase):
         self.worker_log = self.root / f"worker-{self.worker_generation}.log"
         with self.worker_log.open("wb") as log:
             self.worker = subprocess.Popen(
-                [str(Path(sys.executable).parent / "cmd-worker"), "--config", str(config)],
+                [str(self.worker_entry), "--config", str(config)],
                 cwd=self.root, stdout=log, stderr=log,
             )
 
@@ -230,10 +233,11 @@ class CmdEndToEndTest(unittest.TestCase):
         self.assertGreater(replies[0].seq, prev_seq)
         return replies[0]
 
-    def run_command(self, command, *, channel=None, timeout_ms=30000):
+    def run_command(self, command, *, channel=None, timeout_ms=30000, object_keys=()):
         return self.cmd.publish_run_request(
             self.requester, self.token, channel or self.channel,
             CmdRunRequestInput(command, workdir=str(self.root), timeout_ms=timeout_ms),
+            object_keys=object_keys,
         )
 
     def read_output(self, target, offset, nbytes, *, channel=None, stream="stdout"):
@@ -265,6 +269,41 @@ class CmdEndToEndTest(unittest.TestCase):
         self.assertEqual(content.bytes, 5)
         self.assertTrue(content.eof)
 
+    def test_command_reads_attached_object_without_calling_requester(self):
+        data = b"attached object\x00payload\n"
+        written = self.client.write_object(
+            self.requester, self.token, "attachment.bin", "application/octet-stream", data,
+        )
+        key = openevent_pb2.ObjectKey(object_id=written.object_id, object_token=written.object_token)
+        code = (
+            "import json, os, sys; from openevent.sdk import OpenEventClient; "
+            "key = json.loads(os.environ['OPENEVENT_OBJECT_KEYS'])[0]; "
+            "client = OpenEventClient(os.environ['OPENEVENT_OBJECT_TARGET']); "
+            "metadata = client.get_object_metadata(**key); "
+            "sys.stdout.buffer.write(client.read_object(**key, offset=0, nbytes=metadata.nbytes).data); "
+            "client.close()"
+        )
+        child = shlex.join([sys.executable, "-B", "-c", code])
+        # Publish before worker startup to exercise credential recovery from
+        # persisted requests. Both independent children use their own copy.
+        seq = self.run_command(f"{child} && {child}", object_keys=[key])
+        with patch.dict(os.environ, {
+            "OPENEVENT_OBJECT_TARGET": self.public, "OPENEVENT_OBJECT_KEYS": "stale-worker-value",
+        }):
+            self.start_worker()
+        accepted = self.reply("cmd.run.accepted", seq)
+        result = self.reply("cmd.run.result", seq)
+        self.assertEqual(result.payload.status, "SUCCESS")
+        self.assertEqual(decoded(result.payload.stdout), data * 2)
+        self.assertEqual(decoded(result.payload.stderr), b"")
+        self.assertEqual(accepted.object_keys, ())
+        self.assertEqual(result.object_keys, ())
+        request = next(item for item in self.messages() if item.seq == seq)
+        self.assertEqual(request.object_keys, (key,))
+        self.assertNotIn(key.object_token, request.payload.command)
+        empty = self.run_command("printf '%s' \"$OPENEVENT_OBJECT_KEYS\"")
+        self.assertEqual(decoded(self.reply("cmd.run.result", empty).payload.stdout), b"[]")
+
     def test_kill_running_command(self):
         self.start_worker()
         seq = self.run_command("printf started > started; exec sleep 30")
@@ -273,6 +312,17 @@ class CmdEndToEndTest(unittest.TestCase):
         kill = self.kill_command(seq)
         self.assertEqual(self.reply("cmd.kill.result", kill).payload.status, "KILL_SENT")
         self.assertEqual(self.reply("cmd.run.result", seq).payload.status, "KILLED")
+
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                if restart:
+                    self.stop_worker()
+                    self.start_worker()
+                for target_seq in (seq, 2**63 - 1):
+                    kill = self.kill_command(target_seq)
+                    self.assertEqual(self.reply("cmd.kill.result", kill).payload.status, "NOT_RUNNING")
+                self.assertEqual(len(self.replies("cmd.run.accepted", seq)), 1)
+                self.assertEqual(len(self.replies("cmd.run.result", seq)), 1)
 
     def test_restart_recovers_accepted_without_executing_again(self):
         self.start_worker()
@@ -339,7 +389,7 @@ class CmdEndToEndTest(unittest.TestCase):
         self.reply("cmd.run.accepted", seq)
         self.wait_for(lambda: (self.root / "started").exists(), "command start")
         wrong_kill = self.kill_command(seq, channel=second)
-        self.assertEqual(self.reply("cmd.kill.result", wrong_kill).payload.status, "NOT_FOUND")
+        self.assertEqual(self.reply("cmd.kill.result", wrong_kill).payload.status, "NOT_RUNNING")
         self.assertEqual(self.read_output(seq, 0, 20, channel=second).status, "NOT_FOUND")
         kill = self.kill_command(seq)
         self.assertEqual(self.reply("cmd.kill.result", kill).payload.status, "KILL_SENT")

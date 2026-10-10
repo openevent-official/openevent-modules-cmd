@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import signal
 import subprocess
@@ -41,7 +42,7 @@ class CommandRunner:
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
 
-    def start(self, channel_id: int, seq: int, command: str, workdir: str | None, timeout_ms: int, deadline_ms: int) -> RunningCommand:
+    def start(self, channel_id: int, seq: int, command: str, workdir: str | None, timeout_ms: int, deadline_ms: int, *, object_keys=()) -> RunningCommand:
         channel_dir = self.output_dir / str(channel_id)
         try:
             channel_dir.mkdir(parents=True, exist_ok=True)
@@ -49,12 +50,18 @@ class CommandRunner:
             raise CommandStartError(f"cannot create channel output directory: {exc}") from exc
         stdout_path = channel_dir / f"{seq}.stdout"
         stderr_path = channel_dir / f"{seq}.stderr"
+        environment = os.environ.copy()
+        environment["OPENEVENT_OBJECT_KEYS"] = json.dumps(
+            [{"object_id": int(key.object_id), "object_token": key.object_token} for key in object_keys],
+            ensure_ascii=True, separators=(",", ":"),
+        )
         try:
             with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
                 process = subprocess.Popen(
                     command,
                     shell=True,
                     cwd=workdir,
+                    env=environment,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,

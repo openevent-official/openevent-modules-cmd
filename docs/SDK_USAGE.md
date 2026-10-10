@@ -8,6 +8,7 @@ See the [protocol](CMD_PROTOCOL.md) for message formats.
 
 ```python
 from openevent.sdk import OpenEventClient
+from openevent.sdk.proto import openevent_pb2
 from openevent.cmd_sdk import (
     CmdRunRequestInput,
     CmdKillRequestInput,
@@ -27,6 +28,7 @@ run_seq = client.publish_run_request(
         workdir="/absolute/path/to/workdir",
         timeout_ms=300000,
     ),
+    object_keys=[openevent_pb2.ObjectKey(object_id=123, object_token="object-token-123")],
 )
 
 kill_seq = client.publish_kill_request(
@@ -76,12 +78,16 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 
 - Publish methods return the integer message seq and use OpenEvent
   `PublishAutoSeq`. Request methods set empty recipients automatically.
+- `publish_run_request(..., object_keys=())` accepts an iterable of OpenEvent SDK
+  `ObjectKey` values and writes them into the message envelope. Omitting it sends
+  no attachments. See the [run request protocol](CMD_PROTOCOL.md#3-cmdrunrequest)
+  for how child processes receive credentials.
 - Every publish method accepts the optional keyword argument `uuid`. If omitted,
   the installed OpenEvent SDK allocates a UUID; otherwise the supplied value is
   used. These helpers do not retry automatically. UUID reuse and message
   consistency follow the OpenEvent SDK API contract.
 - `parse_message(message)` returns `ParsedMessage` with top-level seq, channel_id,
-  principal, recipients, and a validated payload model. Invalid payloads raise
+  principal, recipients, an `object_keys` tuple, and a validated payload model. Invalid payloads raise
   `CmdSDKError`, exposing `code` and `message`; OpenEvent RPC errors propagate
   unchanged.
 - Read `content_encoding` alongside output content.

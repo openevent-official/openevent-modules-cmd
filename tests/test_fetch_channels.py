@@ -7,8 +7,11 @@ from unittest.mock import Mock, patch
 
 import grpc
 
+from openevent.cmd_sdk.model import CmdRunRequest
+from openevent.cmd_worker.channel_resolver import ChannelValidationError
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
-from openevent.cmd_worker.worker import CmdWorker
+from openevent.cmd_worker.worker import ActiveRun, CmdWorker, RunEvent
+from openevent.sdk.proto import openevent_pb2
 
 
 class FetchWithChannelsClient:
@@ -30,6 +33,24 @@ class FetchWithChannelsClient:
 
 
 class FetchChannelsTest(unittest.TestCase):
+    def test_startup_channel_validation_accepts_v2_and_rejects_v1(self) -> None:
+        for protocol in ("cmd.v2", "cmd.v1"):
+            with self.subTest(protocol=protocol):
+                client = SimpleNamespace(get_channel=Mock(return_value=SimpleNamespace(
+                    channel=SimpleNamespace(
+                        protocol=protocol,
+                        visibility=openevent_pb2.VISIBILITY_PRIVATE,
+                        members=[30001],
+                    ),
+                )))
+                worker = CmdWorker(_config(), client)
+                if protocol == "cmd.v2":
+                    worker.resolver.validate_startup()
+                    self.assertEqual(client.get_channel.call_count, 2)
+                else:
+                    with self.assertRaisesRegex(ChannelValidationError, "protocol must be cmd.v2"):
+                        worker.resolver.validate_startup()
+
     def test_worker_fetch_uses_configured_channels(self) -> None:
         client = FetchWithChannelsClient()
         worker = CmdWorker(_config(), client)
@@ -63,7 +84,8 @@ class FetchChannelsTest(unittest.TestCase):
         worker = CmdWorker(_config(), client)
         worker.startup = Mock()
         task = SimpleNamespace(channel_id=2001, seq=1)
-        worker.running[(2001, 1)] = task
+        event = RunEvent(1, 2001, 1001, 1000, CmdRunRequest(command="true", ts_ms=1000))
+        worker.running[(2001, 1)] = ActiveRun(event, task)
         worker.runner.terminate = Mock()
         worker.runner.wait = Mock()
 

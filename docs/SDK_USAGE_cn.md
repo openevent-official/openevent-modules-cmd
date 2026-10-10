@@ -8,6 +8,7 @@
 
 ```python
 from openevent.sdk import OpenEventClient
+from openevent.sdk.proto import openevent_pb2
 from openevent.cmd_sdk import (
     CmdRunRequestInput,
     CmdKillRequestInput,
@@ -27,6 +28,7 @@ run_seq = client.publish_run_request(
         workdir="/absolute/path/to/workdir",
         timeout_ms=300000,
     ),
+    object_keys=[openevent_pb2.ObjectKey(object_id=123, object_token="object-token-123")],
 )
 
 kill_seq = client.publish_kill_request(
@@ -75,9 +77,12 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
 ## 集成说明
 
 - 发布方法返回消息的整数 seq，使用 OpenEvent `PublishAutoSeq`；请求方法自动使用空 recipients。
+- `publish_run_request(..., object_keys=())` 接收可迭代的 OpenEvent SDK `ObjectKey`，写入消息顶层。
+  省略时不带附件；子进程如何取得凭据见[运行请求协议](CMD_PROTOCOL_cn.md#3-cmdrunrequest)。
 - 所有发布方法支持可选关键字参数 `uuid`。省略时从已安装的 OpenEvent SDK 分配 UUID；指定时使用传入值。
   本辅助层不自动重试。UUID 复用和消息一致性规则以 OpenEvent SDK API 为准。
-- `parse_message(message)` 返回 `ParsedMessage`，包含顶层 seq、channel_id、principal、recipients 和已校验的 payload 模型。
+- `parse_message(message)` 返回 `ParsedMessage`，包含顶层 seq、channel_id、principal、recipients、
+  `object_keys` 元组和已校验的 payload 模型。
   非法 payload 抛出 `CmdSDKError`，可读取其 `code` 和 `message`；OpenEvent RPC 错误保持原异常。
 - 读取输出内容时，同时读取 `content_encoding`。
 

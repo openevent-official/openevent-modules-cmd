@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openevent.sdk.proto import openevent_pb2
 
 
 MAX_TIMEOUT_MS = 2**64 - 1
@@ -24,7 +28,7 @@ RUN_STATUSES = frozenset(
         "REJECTED",
     }
 )
-KILL_STATUSES = frozenset({"KILL_SENT", "REMOVED_PENDING", "ALREADY_FINISHED", "NOT_FOUND", "REJECTED"})
+KILL_STATUSES = frozenset({"KILL_SENT", "REMOVED_PENDING", "NOT_RUNNING", "REJECTED"})
 OUTPUT_READ_STATUSES = frozenset({"SUCCESS", "NOT_FOUND", "READ_FAILED", "REJECTED"})
 OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
 
@@ -192,3 +196,4 @@ class ParsedMessage:
     principal: int
     recipients: tuple[int, ...]
     payload: CmdPayload
+    object_keys: tuple[openevent_pb2.ObjectKey, ...] = ()

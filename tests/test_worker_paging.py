@@ -10,7 +10,7 @@ from unittest.mock import Mock
 from openevent.cmd_sdk.model import CmdRunRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import RunningCommand
-from openevent.cmd_worker.worker import CmdWorker, CompletionEvent, RunEvent
+from openevent.cmd_worker.worker import ActiveRun, CmdWorker, CompletionEvent, RunEvent
 
 from test_worker_lifecycle import FakeClient, FakeProcess, RecordingPublisher, message
 
@@ -59,8 +59,7 @@ class WorkerPagingTest(unittest.TestCase):
             channel_id=2001, seq=1, process=FakeProcess(returncode=0),
             started_at_ms=1000, timeout_ms=1000, deadline_ms=2000,
         )
-        self.worker.requests[(2001, 1)] = event
-        self.worker.running[(2001, 1)] = task
+        self.worker.running[(2001, 1)] = ActiveRun(event, task)
 
         def fetch(principal, token, *, from_seq, **kwargs):
             if from_seq == 1:
@@ -68,14 +67,30 @@ class WorkerPagingTest(unittest.TestCase):
                 return SimpleNamespace(messages=[], next_seq=3, last_seq=3)
             self.assertEqual(from_seq, 3)
             self.assertFalse(self.worker.running)
-            self.assertFalse(self.worker.requests)
-            self.assertTrue(self.worker._has_run_result(2001, 1))
+            self.assertFalse(self.worker.pending)
             self.assertEqual(self.worker.publisher.records[0]["status"], "SUCCESS")
             return SimpleNamespace(messages=[], next_seq=4)
 
         self.client.fetch = fetch
 
         self.assertEqual(self.worker._fetch_round(), (False, True))
+
+    def test_completion_is_published_after_the_final_page(self):
+        self.worker.running[(2001, 1)] = ActiveRun(_run_event(1), RunningCommand(
+            channel_id=2001, seq=1, process=FakeProcess(returncode=0),
+            started_at_ms=1000, timeout_ms=1000, deadline_ms=2000,
+        ))
+
+        def fetch(principal, token, *, from_seq, **kwargs):
+            self.worker.completions.put(CompletionEvent(2001, 1, 0))
+            return SimpleNamespace(messages=[], next_seq=2, last_seq=1)
+
+        self.client.fetch = fetch
+
+        self.assertEqual(self.worker._fetch_round(), (False, True))
+        self.assertFalse(self.worker.running)
+        self.assertFalse(self.worker.pending)
+        self.assertEqual(self.worker.publisher.records[0]["status"], "SUCCESS")
 
     def test_new_runs_start_only_after_fixed_boundary_and_same_round_kill(self):
         self.worker.startup = Mock()
@@ -109,7 +124,8 @@ class WorkerPagingTest(unittest.TestCase):
         self.worker.run()
 
         self.worker._start_or_timeout.assert_called_once()
-        self.assertNotIn((2001, 4), self.worker.requests)
+        self.assertNotIn((2001, 4), self.worker.pending)
+        self.assertNotIn((2001, 4), self.worker.running)
         self.worker.stop.assert_called_once_with()
 
     def test_empty_filtered_first_page_does_not_end_round(self):
@@ -125,22 +141,28 @@ class WorkerPagingTest(unittest.TestCase):
         self.assertEqual([call.kwargs["from_seq"] for call in self.client.fetch.call_args_list], [1, 5])
 
     def test_previous_page_and_last_message_are_released_before_next_fetch(self):
-        references = []
-        self.worker._observe_realtime_message = lambda item: None
+        for mode in ("history", "realtime"):
+            with self.subTest(mode=mode):
+                references = []
+                self.worker.next_fetch_seq = 1
+                self.worker._observe_message = lambda item, **kwargs: None
 
-        def fetch(principal, token, *, from_seq, **kwargs):
-            if from_seq == 1:
-                item = TrackedNamespace(seq=1, payload=b"x" * 1024)
-                page = TrackedNamespace(messages=[item], next_seq=2, last_seq=2)
-                references.extend([weakref.ref(page), weakref.ref(item)])
-                return page
-            self.assertEqual(from_seq, 2)
-            self.assertTrue(all(reference() is None for reference in references))
-            return SimpleNamespace(messages=[], next_seq=3)
+                def fetch(principal, token, *, from_seq, **kwargs):
+                    if from_seq == 1:
+                        item = TrackedNamespace(seq=1, payload=b"x" * 1024)
+                        page = TrackedNamespace(messages=[item], next_seq=2, last_seq=2)
+                        references.extend([weakref.ref(page), weakref.ref(item)])
+                        return page
+                    self.assertEqual(from_seq, 2)
+                    self.assertTrue(all(reference() is None for reference in references))
+                    return SimpleNamespace(messages=[], next_seq=3)
 
-        self.client.fetch = fetch
+                self.client.fetch = fetch
 
-        self.assertEqual(self.worker._fetch_round(), (True, False))
+                if mode == "history":
+                    self.assertFalse(self.worker._scan_history().requests)
+                else:
+                    self.assertEqual(self.worker._fetch_round(), (True, False))
 
     def test_nonadvancing_page_fails_on_first_or_later_page(self):
         for stalled_seq in (1, 2):

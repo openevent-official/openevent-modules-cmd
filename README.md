@@ -2,7 +2,7 @@
 
 [中文版](README_cn.md)
 
-The OpenEvent Cmd module provides a `cmd.v1` SDK and a Linux command worker.
+The OpenEvent Cmd module provides a `cmd.v2` SDK and a Linux command worker.
 Messages run or terminate commands, store stdout/stderr in local files, publish
 results, and read byte ranges from output files.
 
@@ -27,6 +27,7 @@ make check-docs
 Select the installation and test environment with `PYTHON=/path/to/venv/bin/python`.
 `make install` builds and replaces this package, even at the same version, and
 installs only missing or incompatible dependencies. Use `make build` to build without installing.
+User installations are supported with `INSTALL_ARGS=--user` for `make install` and `make e2e`.
 
 `make test` runs unit and installation regression tests. End-to-end tests require
 an OpenEvent server from a successful current build:

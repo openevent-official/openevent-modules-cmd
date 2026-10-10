@@ -12,7 +12,7 @@ from openevent.cmd_sdk.model import CmdRunRequest
 from openevent.cmd_worker import cli
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
 from openevent.cmd_worker.runner import now_ms
-from openevent.cmd_worker.worker import CmdWorker, RunEvent
+from openevent.cmd_worker.worker import ActiveRun, CmdWorker, RunEvent
 
 
 class WorkerSignalsTest(unittest.TestCase):
@@ -102,7 +102,10 @@ class WorkerSignalsTest(unittest.TestCase):
                             2001, seq, "exec sleep 30", None, 30000, now_ms() + 30000,
                         )
                         created.append(task)
-                        worker.running[(2001, seq)] = task
+                        event = RunEvent(seq, 2001, 1001, task.started_at_ms, CmdRunRequest(
+                            command="exec sleep 30", timeout_ms=30000, ts_ms=task.started_at_ms,
+                        ))
+                        worker.running[(2001, seq)] = ActiveRun(event, task)
 
                 def interrupted_fetch(*args, **kwargs):
                     if first_signal is None:
@@ -180,7 +183,7 @@ class WorkerSignalsTest(unittest.TestCase):
                     return task
 
                 def record_stop():
-                    tracked_at_stop.extend(worker.running.values())
+                    tracked_at_stop.extend(active.command for active in worker.running.values())
                     original_stop()
 
                 worker.startup = startup
@@ -197,7 +200,7 @@ class WorkerSignalsTest(unittest.TestCase):
                     stop.assert_called_once_with()
                     self.assertEqual(len(created), 1)
                     self.assertEqual(tracked_at_stop, created)
-                    self.assertIs(worker.running[(2001, 1)], created[0])
+                    self.assertIs(worker.running[(2001, 1)].command, created[0])
                     self.assertEqual(worker.runner.wait(created[0], timeout=5), -signal.SIGKILL)
                     self.assertEqual([event.seq for event in worker.pending.values()], [2])
                     worker.publisher.publish_run_accepted.assert_called_once_with(2001, 1001, 1)

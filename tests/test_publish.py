@@ -8,10 +8,11 @@ from unittest.mock import patch
 import grpc
 
 from openevent.sdk import OpenEventClient
+from openevent.sdk.proto import openevent_pb2
 from openevent.cmd_sdk import (
     CmdKillRequestInput, CmdKillResultInput, CmdOutput,
     CmdOutputReadRequestInput, CmdOutputReadResultInput,
-    CmdRunRequestInput, CmdRunResultInput, create_client,
+    CmdRunRequestInput, CmdRunResultInput, create_client, parse_message,
 )
 from openevent.cmd_worker.publisher import PublishFatal, ReliablePublisher
 
@@ -95,6 +96,28 @@ class PublishTest(unittest.TestCase):
         client, stub = self.client()
         publisher = ReliablePublisher(client, 30001, "worker-token", max_payload_bytes)
         return publisher, client, stub
+
+    def test_run_object_keys_round_trip_in_message_envelope(self):
+        client, stub = self.client()
+        keys = [
+            openevent_pb2.ObjectKey(object_id=2**63 + 7, object_token='token-"one"'),
+            openevent_pb2.ObjectKey(object_id=23, object_token="token-two"),
+        ]
+        create_client(client).publish_run_request(
+            1001, "token", 2001, CmdRunRequestInput(command="true", ts_ms=123),
+            object_keys=iter(keys), uuid=424242,
+        )
+        request, _ = stub.publishes[0]
+        self.assertEqual(list(request.object_keys), keys)
+        self.assertNotIn("object_keys", json.loads(request.payload))
+        self.assertNotIn("object_token", json.loads(request.payload))
+        message = openevent_pb2.EventMessage(
+            seq=100, channel_id=request.channel_id, principal=request.principal,
+            recipients=request.recipients, payload=request.payload, object_keys=request.object_keys,
+        )
+        parsed = parse_message(message)
+        self.assertEqual(parsed.object_keys, tuple(keys))
+        self.assertEqual(parsed.payload.command, "true")
 
     def test_all_public_publish_helpers_use_installed_sdk_and_uuid(self):
         cases = (

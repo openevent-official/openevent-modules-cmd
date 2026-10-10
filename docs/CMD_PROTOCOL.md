@@ -1,10 +1,10 @@
-# Cmd Protocol cmd.v1
+# Cmd Protocol cmd.v2
 
 [中文版](CMD_PROTOCOL_cn.md)
 
 ## 1. Channel
 
-Cmd channels must set `protocol="cmd.v1"` and must not use public visibility.
+Cmd channels must set `protocol="cmd.v2"` and must not use public visibility.
 Both caller and worker principals must be channel members. Only one active
 worker may consume a channel at a time.
 
@@ -74,6 +74,32 @@ fail and exit.
   configuration, including for `RECOVERY_FAILED`.
 - The deadline is this message's top-level `EventMessage.ts_ms` plus the effective
   `timeout_ms`, never the payload's `ts_ms`.
+
+The caller may attach the object read credentials needed by the command in this
+message's top-level OpenEvent `object_keys`; this is not a payload field. The
+worker passes these credentials into this command's environment, so the command
+does not need to query the caller for them. The rules are:
+
+- The worker inherits its own process environment and sets `OPENEVENT_OBJECT_KEYS`
+  for this shell.
+- Its value is a JSON array in request order. Each entry contains an integer
+  `object_id` and a string `object_token`, preserving the complete ObjectKey.
+  No attachments means `[]`, overriding any inherited value in the worker's
+  environment. Credentials are neither shared nor accumulated across tasks.
+- The variable is inherited by the command and its children and can be read
+  repeatedly. The worker does not insert credentials into `command` or print them.
+- The deployment environment supplies the object service address. Cmd does not
+  download objects or provide an attachment reader.
+- Credentials and other process environment values are subject to the operating
+  system's argument and environment size limits. A resulting startup failure
+  produces `START_FAILED`. Other requests and accepted/result messages do not
+  forward task attachment credentials.
+
+For example, two attachments produce this environment variable value:
+
+```json
+[{"object_id":123,"object_token":"object-token-123"},{"object_id":456,"object_token":"object-token-456"}]
+```
 
 ## 4. `cmd.run.accepted`
 
@@ -184,7 +210,7 @@ section 9.
 - The worker only terminates running or pending tasks in its current process;
   pending tasks are removed directly from the queue.
 - Any channel member can kill tasks in that channel, without being the original
-  submitter. A `target_seq` in another channel returns `NOT_FOUND`; the worker
+  submitter. A `target_seq` in another channel returns `NOT_RUNNING`; the worker
   does not operate across channels.
 
 ## 7. `cmd.kill.result`
@@ -208,19 +234,18 @@ or missing, `REJECTED` may omit the field.
 | --- | --- |
 | `KILL_SENT` | Target shell is still running; a kill signal was sent to its task process group. |
 | `REMOVED_PENDING` | Target had not started and was removed from the queue. |
-| `ALREADY_FINISHED` | Target has a final run result, or its shell has exited and group cleanup and reaping are complete; in the latter case, the run result is written first. |
-| `NOT_FOUND` | Target task was not found. |
+| `NOT_RUNNING` | No running or pending target can be terminated in this channel. Completed and nonexistent tasks are not distinguished. |
 | `REJECTED` | Request payload is invalid or exceeds protocol/configuration limits; no kill signal was sent. |
 
 If the kill triggers termination first, the run result is `KILLED`; if a timeout
 already triggered, it remains `TIMEOUT`. When removing a pending task, the worker
 confirms the `KILLED` run result before writing `REMOVED_PENDING`. A crash between
 these results leaves the run request closed after restart; the unfinished kill
-request may return `ALREADY_FINISHED`.
+request returns `NOT_RUNNING`.
 
 If the shell has exited but cleanup is unfinished, the worker completes cleanup
 and reaping under [Task Process Lifecycle](CONFIGURATION.md#task-process-lifecycle),
-writes the run result, then writes `ALREADY_FINISHED`. The run result preserves an
+writes the run result, then writes `NOT_RUNNING`. The run result preserves an
 established `TIMEOUT`/`KILLED`; otherwise the shell exit code selects
 `SUCCESS`/`FAILED`. Cleanup of remaining group members does not change it to `KILLED`.
 
@@ -291,4 +316,5 @@ The last three statuses use `content=""`, `bytes=0`, and `content_encoding="utf-
 
 ## 10. Versioning Policy
 
-Breaking changes must use a new protocol, such as `cmd.v2`.
+This package implements `cmd.v2`. It requires channels and callers using this protocol.
+Breaking changes must use a new protocol, such as `cmd.v3`.
