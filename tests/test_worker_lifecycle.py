@@ -41,7 +41,7 @@ class FakeClient:
 
     def get_channel(self, principal, token, channel_id):
         return SimpleNamespace(channel=SimpleNamespace(
-            protocol="cmd.v2",
+            protocol="cmd.v3",
             visibility=openevent_pb2.VISIBILITY_PRIVATE,
             members=[principal],
             description="Command execution",

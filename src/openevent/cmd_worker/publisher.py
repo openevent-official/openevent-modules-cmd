@@ -38,13 +38,23 @@ class ReliablePublisher:
         self._publish(channel_id, request_principal, kill_result_input_to_dict(result))
 
     def publish_output_read_result(self, channel_id, request_principal, result) -> None:
-        self._publish(channel_id, request_principal, output_read_result_input_to_dict(result))
+        data = output_read_result_input_to_dict(result)
+        payload = dumps_payload(data)
+        if data["status"] == "SUCCESS" and len(payload) > self.max_payload_bytes:
+            data.update(
+                status="READ_FAILED", bytes=0, eof=False, content_encoding="utf-8",
+                content="", error_message="encoded output read result exceeds max_payload_bytes",
+            )
+            payload = dumps_payload(data)
+        self._publish_payload(channel_id, request_principal, data["kind"], data["prev_seq"], payload)
 
     def _publish(self, channel_id, request_principal, data) -> None:
-        # Freeze the timestamp, encoded payload and UUID for both attempts.
-        payload = dumps_payload(data)
+        self._publish_payload(channel_id, request_principal, data["kind"], data["prev_seq"], dumps_payload(data))
+
+    def _publish_payload(self, channel_id, request_principal, kind, prev_seq, payload: bytes) -> None:
+        # Reuse the validated bytes and one UUID for both attempts.
         if len(payload) > self.max_payload_bytes:
-            raise PublishFatal(f"{data['kind']} payload exceeds max_payload_bytes")
+            raise PublishFatal(f"{kind} payload exceeds max_payload_bytes")
         uuid = self.client.get_uuid()
         for attempt in range(2):
             try:
@@ -57,6 +67,6 @@ class ReliablePublisher:
                 if exc.code() == grpc.StatusCode.ALREADY_EXISTS:
                     return
                 if attempt or exc.code() in _DEFINITIVE_FAILURES:
-                    raise PublishFatal(f"failed to publish {data['kind']} for prev_seq={data['prev_seq']}") from exc
-                LOG.warning("publish outcome unknown; retrying the same UUID", extra={"uuid": uuid, "kind": data['kind']})
+                    raise PublishFatal(f"failed to publish {kind} for prev_seq={prev_seq}") from exc
+                LOG.warning("publish outcome unknown; retrying the same UUID", extra={"uuid": uuid, "kind": kind})
         raise AssertionError("publish attempts exhausted")

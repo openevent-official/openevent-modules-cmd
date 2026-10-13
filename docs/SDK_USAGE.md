@@ -46,32 +46,34 @@ read_seq = client.publish_output_read_request(
         target_seq=run_seq,
         stream="stdout",
         offset=0,
-        nbytes=1024,
+        nbytes=6,
     ),
 )
 ```
 
-Parse messages with the module-level helper:
+Skip [OpenEvent system messages](CONFIGURATION.md#channel-requirements), then
+parse Cmd messages with the module-level helper:
 
 ```python
 from openevent.cmd_sdk import parse_message
 
-parsed = parse_message(message)
-if parsed.payload.kind == "cmd.run.accepted":
-    print(parsed.payload.prev_seq)
+if message.principal != 0:
+    parsed = parse_message(message)
+    if parsed.payload.kind == "cmd.run.accepted":
+        print(parsed.payload.prev_seq)
 
-if parsed.payload.kind == "cmd.run.result":
-    if parsed.payload.stdout.content is not None:
-        print(parsed.payload.stdout.content, parsed.payload.stdout.content_encoding)
-    else:
-        print(parsed.payload.stdout.file, parsed.payload.stdout.bytes)
+    if parsed.payload.kind == "cmd.run.result":
+        if parsed.payload.stdout.content is not None:
+            print(parsed.payload.stdout.content, parsed.payload.stdout.content_encoding)
+        else:
+            print(parsed.payload.stdout.file, parsed.payload.stdout.bytes)
 
-if parsed.payload.kind == "cmd.output.read.result":
-    print(parsed.payload.content, parsed.payload.content_encoding)
+    if parsed.payload.kind == "cmd.output.read.result":
+        print(parsed.payload.content, parsed.payload.content_encoding)
 
-if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read.result"}:
-    if parsed.payload.error_message is not None:
-        print(parsed.payload.error_message)
+    if parsed.payload.kind in {"cmd.run.result", "cmd.output.read.result"}:
+        if parsed.payload.error_message is not None:
+            print(parsed.payload.error_message)
 ```
 
 ## Integration Notes
@@ -86,11 +88,12 @@ if parsed.payload.kind in {"cmd.run.result", "cmd.kill.result", "cmd.output.read
   the installed OpenEvent SDK allocates a UUID; otherwise the supplied value is
   used. These helpers do not retry automatically. UUID reuse and message
   consistency follow the OpenEvent SDK API contract.
-- `parse_message(message)` returns `ParsedMessage` with top-level seq, channel_id,
-  principal, recipients, an `object_keys` tuple, and a validated payload model. Invalid payloads raise
-  `CmdSDKError`, exposing `code` and `message`; OpenEvent RPC errors propagate
-  unchanged.
-- Read `content_encoding` alongside output content.
+- `parse_message(message)` parses only Cmd messages and returns `ParsedMessage`
+  with top-level seq, channel_id, principal, recipients, an `object_keys` tuple,
+  and a validated payload model. Invalid payloads raise `CmdSDKError`, exposing
+  `code` and `message`; OpenEvent RPC errors propagate unchanged.
+- Read `content_encoding` alongside output content. The complete requested byte
+  range must be returnable; see the [exact-read rules](CMD_PROTOCOL.md#8-cmdoutputreadrequest).
 
 ## Worker Publish Interface
 
@@ -106,3 +109,9 @@ client.publish_output_read_result(principal, token, channel_id, request_principa
 
 The three `result_payload` arguments use `CmdRunResultInput`, `CmdKillResultInput`,
 and `CmdOutputReadResultInput`, respectively.
+Construction requires explicit values for `CmdRunResultInput.timeout_ms`,
+`CmdKillResultInput.target_seq`, and the `target_seq`, `stream`, `offset`, and
+`nbytes` parameters of `CmdOutputReadResultInput`; none may be omitted. See the
+[run result](CMD_PROTOCOL.md#5-cmdrunresult), [kill result](CMD_PROTOCOL.md#7-cmdkillresult),
+and [output-read result](CMD_PROTOCOL.md#9-cmdoutputreadresult) protocols for field
+meanings and status requirements.

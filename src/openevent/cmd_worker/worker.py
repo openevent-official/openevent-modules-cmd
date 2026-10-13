@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
-import logging
 import os
 import subprocess
 import threading
@@ -19,14 +17,10 @@ if TYPE_CHECKING:
 
 import grpc
 
-from openevent.cmd_sdk import identify_kind, parse_message
-from openevent.cmd_sdk.codec import dumps_payload, output_read_result_input_to_dict
+from openevent.cmd_sdk import parse_message
 from openevent.cmd_sdk.errors import CmdSDKError
 from openevent.cmd_sdk.dependencies import require_sdk
 from openevent.cmd_sdk.model import (
-    KIND_KILL_REQUEST,
-    KIND_OUTPUT_READ_REQUEST,
-    KIND_RUN_REQUEST,
     CmdKillRequest,
     CmdKillResult,
     CmdKillResultInput,
@@ -41,10 +35,8 @@ from openevent.cmd_sdk.model import (
 
 from .channel_resolver import ChannelResolver
 from .config import CmdWorkerConfig
-from .publisher import PublishFatal, ReliablePublisher
+from .publisher import ReliablePublisher
 from .runner import CommandRunner, CommandStartError, RunningCommand, empty_output, now_ms
-
-LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,16 +72,6 @@ class OutputReadEvent:
 
 
 @dataclass(frozen=True)
-class InvalidRequestEvent:
-    seq: int
-    channel_id: int
-    principal: int
-    kind: str
-    error_message: str
-    payload: bytes
-
-
-@dataclass(frozen=True)
 class CompletionEvent:
     channel_id: int
     seq: int
@@ -100,7 +82,7 @@ class CompletionEvent:
 @dataclass
 class _RecoveryState:
     requests: dict[
-        tuple[int, int], RunEvent | KillEvent | OutputReadEvent | InvalidRequestEvent
+        tuple[int, int], RunEvent | KillEvent | OutputReadEvent
     ] = field(default_factory=dict)
     accepted: set[tuple[int, int]] = field(default_factory=set)
 
@@ -229,13 +211,18 @@ class CmdWorker:
             self._handle_event(event)
 
     def _observe_message(self, message, *, recovery: _RecoveryState | None = None):
+        # Ordinary cmd channels also contain OpenEvent system messages.
+        if int(message.principal) == 0:
+            return None
         channel_id = int(message.channel_id)
         if not self.resolver.owns(channel_id):
             return None
         try:
             parsed = parse_message(message)
         except CmdSDKError as exc:
-            return self._invalid_event_from_message(message, exc)
+            raise RuntimeError(
+                f"failed to parse Cmd message channel_id={channel_id} seq={int(message.seq)}: {exc.code}"
+            ) from exc
         payload = parsed.payload
         if isinstance(payload, CmdRunAccepted):
             if recovery is not None and (channel_id, payload.prev_seq) in recovery.requests:
@@ -257,13 +244,6 @@ class CmdWorker:
             return OutputReadEvent(parsed.seq, parsed.channel_id, parsed.principal, payload)
         return None
 
-    def _invalid_event_from_message(self, message, exc: CmdSDKError) -> InvalidRequestEvent | None:
-        kind = identify_kind(message.payload)
-        if kind in {KIND_RUN_REQUEST, KIND_KILL_REQUEST, KIND_OUTPUT_READ_REQUEST}:
-            return InvalidRequestEvent(int(message.seq), int(message.channel_id), int(message.principal), kind, exc.message, message.payload)
-        LOG.warning("invalid cmd payload ignored", extra={"seq": int(message.seq), "error": exc.code})
-        return None
-
     def _handle_event(self, event) -> None:
         if isinstance(event, RunEvent):
             self._handle_run_event(event)
@@ -271,8 +251,6 @@ class CmdWorker:
             self._handle_kill_event(event)
         elif isinstance(event, OutputReadEvent):
             self._handle_output_read_event(event)
-        elif isinstance(event, InvalidRequestEvent):
-            self._handle_invalid_request_event(event)
 
     def _handle_run_event(self, event: RunEvent) -> None:
         self.pending[(event.channel_id, event.seq)] = event
@@ -403,66 +381,34 @@ class CmdWorker:
             "nbytes": req.nbytes,
             "ts_ms": now_ms(),
         }
+
+        def failed(reason: str) -> CmdOutputReadResultInput:
+            return CmdOutputReadResultInput(
+                status="READ_FAILED", bytes=0, eof=False, content_encoding="utf-8",
+                content="", error_message=_error_text(reason), **base,
+            )
+
         try:
             with path.open("rb") as handle:
                 size = os.fstat(handle.fileno()).st_size
-                if req.offset >= size:
-                    raw = b""
-                else:
-                    handle.seek(req.offset)
-                    raw = handle.read(min(req.nbytes, size - req.offset, self.config.open_event.max_payload_bytes))
-            while True:
-                content_encoding, content = _encode_content(raw)
-                result = CmdOutputReadResultInput(
-                    status="SUCCESS",
-                    bytes=len(raw),
-                    eof=req.offset + len(raw) >= size,
-                    content_encoding=content_encoding,
-                    content=content,
-                    **base,
-                )
-                if len(dumps_payload(output_read_result_input_to_dict(result))) <= self.config.open_event.max_payload_bytes:
-                    return result
-                if not raw:
-                    raise PublishFatal("output read result envelope exceeds max_payload_bytes")
-                raw = raw[:len(raw) // 2]
+                if req.offset + req.nbytes > size:
+                    return failed("requested range exceeds output file size")
+                # Neither JSON nor base64 can make these raw bytes smaller.
+                if req.nbytes > self.config.open_event.max_payload_bytes:
+                    return failed("requested range exceeds max_payload_bytes")
+                handle.seek(req.offset)
+                raw = handle.read(req.nbytes)
         except FileNotFoundError:
             return CmdOutputReadResultInput(status="NOT_FOUND", bytes=0, eof=True, content_encoding="utf-8", content="", **base)
         except OSError as exc:
-            return CmdOutputReadResultInput(status="READ_FAILED", bytes=0, eof=False, content_encoding="utf-8", content="", error_message=_error_text(str(exc)), **base)
-
-    def _handle_invalid_request_event(self, event: InvalidRequestEvent) -> None:
-        if event.kind == KIND_RUN_REQUEST:
-            output_file = f"{event.channel_id}/{event.seq}"
-            result = CmdRunResultInput(
-                prev_seq=event.seq,
-                status="REJECTED",
-                finished_at_ms=now_ms(),
-                stdout=empty_output(f"{output_file}.stdout"),
-                stderr=empty_output(f"{output_file}.stderr"),
-                error_message=_error_text(event.error_message),
-            )
-            self.publisher.publish_run_result(event.channel_id, event.principal, result)
-        elif event.kind == KIND_KILL_REQUEST:
-            target_seq = _best_effort_int(event.payload, "target_seq")
-            result = CmdKillResultInput(prev_seq=event.seq, target_seq=target_seq, status="REJECTED", error_message=_error_text(event.error_message))
-            self.publisher.publish_kill_result(event.channel_id, event.principal, result)
-        elif event.kind == KIND_OUTPUT_READ_REQUEST:
-            data = _best_effort_dict(event.payload)
-            result = CmdOutputReadResultInput(
-                prev_seq=event.seq,
-                status="REJECTED",
-                target_seq=_best_effort_positive_int_from_dict(data, "target_seq"),
-                stream=data.get("stream") if data.get("stream") in {"stdout", "stderr"} else None,
-                offset=_best_effort_non_negative_int_from_dict(data, "offset"),
-                nbytes=_best_effort_positive_int_from_dict(data, "nbytes"),
-                bytes=0,
-                eof=True,
-                content_encoding="utf-8",
-                content="",
-                error_message=_error_text(event.error_message),
-            )
-            self.publisher.publish_output_read_result(event.channel_id, event.principal, result)
+            return failed(str(exc))
+        if len(raw) != req.nbytes:
+            return failed("output file did not provide the complete requested range")
+        content_encoding, content = _encode_content(raw)
+        return CmdOutputReadResultInput(
+            status="SUCCESS", bytes=len(raw), eof=req.offset + req.nbytes == size,
+            content_encoding=content_encoding, content=content, **base,
+        )
 
     def _publish_recovery_failed(self, event: RunEvent) -> None:
         timeout_ms = event.request.timeout_ms or self.config.default_timeout_ms
@@ -475,7 +421,7 @@ class CmdWorker:
         self,
         event: RunEvent,
         status: str,
-        timeout_ms: int | None = None,
+        timeout_ms: int,
         started_at_ms: int | None = None,
         exit_code: int | None = None,
         error_message: str | None = None,
@@ -487,7 +433,7 @@ class CmdWorker:
         self,
         event: RunEvent,
         status: str,
-        timeout_ms: int | None = None,
+        timeout_ms: int,
         started_at_ms: int | None = None,
         exit_code: int | None = None,
         error_message: str | None = None,
@@ -499,15 +445,14 @@ class CmdWorker:
             status=status,
             timeout_ms=timeout_ms,
             started_at_ms=started_at_ms,
-            finished_at_ms=now_ms(),
             exit_code=exit_code,
             stdout=empty_output(f"{output_file}.stdout") if empty else self.runner.output_for(event.channel_id, event.seq, "stdout"),
             stderr=empty_output(f"{output_file}.stderr") if empty else self.runner.output_for(event.channel_id, event.seq, "stderr"),
             error_message=_error_text(error_message) if error_message else None,
         )
 
-    def _publish_kill_result(self, event: KillEvent, status: str, error_message: str | None = None) -> None:
-        result = CmdKillResultInput(prev_seq=event.seq, target_seq=event.request.target_seq, status=status, error_message=_error_text(error_message) if error_message else None)
+    def _publish_kill_result(self, event: KillEvent, status: str) -> None:
+        result = CmdKillResultInput(prev_seq=event.seq, target_seq=event.request.target_seq, status=status)
         self.publisher.publish_kill_result(event.channel_id, event.principal, result)
 
     def _kill_all_running(self) -> None:
@@ -527,30 +472,3 @@ def _encode_content(raw: bytes) -> tuple[str, str]:
         return "utf-8", raw.decode("utf-8")
     except UnicodeDecodeError:
         return "base64", base64.b64encode(raw).decode("ascii")
-
-
-def _best_effort_dict(payload: bytes) -> dict:
-    try:
-        data = json.loads(payload.decode("utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _best_effort_int(payload: bytes, key: str) -> int | None:
-    data = _best_effort_dict(payload)
-    return _best_effort_positive_int_from_dict(data, key)
-
-
-def _best_effort_positive_int_from_dict(data: dict, key: str) -> int | None:
-    value = data.get(key)
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return None
-
-
-def _best_effort_non_negative_int_from_dict(data: dict, key: str) -> int | None:
-    value = data.get(key)
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return None

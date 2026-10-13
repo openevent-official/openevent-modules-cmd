@@ -37,7 +37,7 @@ fetch_error_retry_sleep_ms: 1000
 | 字段 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `open_event.addr` | 是 | 无 | OpenEvent 服务地址 |
-| `open_event.max_payload_bytes` | 否 | `16777216` | OpenEvent 部署的消息 payload 大小上限，必须是至少 `16384`（16 KiB）的整数；所有 accepted/result 发布前检查最终大小，局部读取据此缩小返回量 |
+| `open_event.max_payload_bytes` | 否 | `16777216` | OpenEvent 部署的消息 payload 大小上限，必须是至少 `16384`（16 KiB）的整数；所有 accepted/result 发布前检查最终大小，局部读取结果超限时按[协议](CMD_PROTOCOL_cn.md#8-cmdoutputreadrequest)返回失败 |
 | `principal` | 是 | 无 | cmd-worker 使用的 OpenEvent principal，必须是正整数 |
 | `token` | 是 | 无 | cmd-worker 使用的 OpenEvent token，必须是非空字符串 |
 | `channel_ids` | 是 | 无 | worker 处理的 channel id 列表，必须是非空、无重复的正整数数组 |
@@ -55,6 +55,10 @@ fetch_error_retry_sleep_ms: 1000
 `channel_ids` 中列出的每个 channel 必须满足[协议的通道规则](CMD_PROTOCOL_cn.md#1-通道)。
 worker 启动时逐个校验可读性、协议、visibility 和 worker 成员身份；任一失败即退出。
 
+通道中也会出现 OpenEvent 生成的初始化、成员变更等系统消息，其顶层 `principal=0`。
+worker 在正常消费和启动恢复时，都在解析 Cmd payload 前直接跳过这些消息，并照常推进扫描游标；
+不把它们当作非法 Cmd 请求，不记录 payload 错误，也不写回 Cmd 结果。
+
 ## 运行注意事项
 
 - `output_dir` 可以是相对路径或绝对路径；相对路径按启动 `cmd-worker` 时的当前工作目录解析。
@@ -67,6 +71,8 @@ worker 启动时逐个校验可读性、协议、visibility 和 worker 成员身
 
 每个命令以 shell 为首进程，创建独立进程组。shell 退出后，worker 先向这个进程组发送 SIGKILL，
 终止同组残留，再回收 shell 并结算任务。
+
+进程创建后，若启动流程因关闭输出文件等操作失败，也会先终止同一进程组并回收 shell，再报告错误。
 
 自然结束后的组清理不把结果改成 KILLED；结果仍按 shell 退出码决定。已经确定的超时或 kill 原因保留，
 具体状态以[运行结果协议](CMD_PROTOCOL_cn.md#5-cmdrunresult)为准。正常完成、超时、kill 和 worker
@@ -92,10 +98,13 @@ worker 启动时从头读取历史，以第一次 Fetch 返回的消息尾部固
 `RECOVERY_FAILED` 时的结果字段。请求显式给出的超时保持原值。
 
 Fetch RPC 异常按上表重试；重试耗尽则 worker 退出。accepted/result 明确发布失败或重试后仍无法
-确认写入时，也会退出。普通程序异常和停止异常直接传播，不走 RPC 重试。
+确认写入时，以及[协议规定的消息解析或校验失败](CMD_PROTOCOL_cn.md#2-公共规则)时，也会报错退出。
+普通程序异常和停止异常直接传播，不走 RPC 重试。
 这些退出路径以及 Ctrl+C、SIGTERM 都会按[任务进程生命周期](#任务进程生命周期)清理当前 worker
 尚未收尾的任务并回收 shell；尚未写回结果的请求由下次启动恢复处理。
 清理期间收到 SIGINT/SIGTERM 不会打断剩余任务的清理。由停止信号触发退出时，CLI 保留首次停止信号对应的退出码。
+
+消息解析或校验失败后，重启仍从头扫描；遇到同一条非法消息仍会报错退出，不会自动跳过。
 
 强制结束 worker 或主机故障无法保证进程清理。恢复不会终止历史 worker 遗留的 OS 进程，也不承诺命令
 执行 exactly-once。

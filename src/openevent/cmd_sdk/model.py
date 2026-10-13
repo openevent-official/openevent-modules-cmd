@@ -25,11 +25,10 @@ RUN_STATUSES = frozenset(
         "KILLED",
         "START_FAILED",
         "RECOVERY_FAILED",
-        "REJECTED",
     }
 )
-KILL_STATUSES = frozenset({"KILL_SENT", "REMOVED_PENDING", "NOT_RUNNING", "REJECTED"})
-OUTPUT_READ_STATUSES = frozenset({"SUCCESS", "NOT_FOUND", "READ_FAILED", "REJECTED"})
+KILL_STATUSES = frozenset({"KILL_SENT", "REMOVED_PENDING", "NOT_RUNNING"})
+OUTPUT_READ_STATUSES = frozenset({"SUCCESS", "NOT_FOUND", "READ_FAILED"})
 OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
 
 
@@ -71,9 +70,8 @@ class CmdRunResultInput:
     status: str
     stdout: CmdOutput
     stderr: CmdOutput
-    finished_at_ms: int
+    timeout_ms: int
     ts_ms: int | None = None
-    timeout_ms: int | None = None
     started_at_ms: int | None = None
     exit_code: int | None = None
     error_message: str | None = None
@@ -86,8 +84,7 @@ class CmdRunResult:
     status: str
     stdout: CmdOutput
     stderr: CmdOutput
-    finished_at_ms: int
-    timeout_ms: int | None = None
+    timeout_ms: int
     started_at_ms: int | None = None
     exit_code: int | None = None
     error_message: str | None = None
@@ -111,9 +108,8 @@ class CmdKillRequest:
 class CmdKillResultInput:
     prev_seq: int
     status: str
+    target_seq: int
     ts_ms: int | None = None
-    target_seq: int | None = None
-    error_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,8 +117,7 @@ class CmdKillResult:
     prev_seq: int
     ts_ms: int
     status: str
-    target_seq: int | None = None
-    error_message: str | None = None
+    target_seq: int
     kind: str = KIND_KILL_RESULT
 
 
@@ -153,11 +148,11 @@ class CmdOutputReadResultInput:
     bytes: int
     eof: bool
     content_encoding: str
+    target_seq: int
+    stream: str
+    offset: int
+    nbytes: int
     ts_ms: int | None = None
-    target_seq: int | None = None
-    stream: str | None = None
-    offset: int | None = None
-    nbytes: int | None = None
     error_message: str | None = None
 
 
@@ -170,10 +165,10 @@ class CmdOutputReadResult:
     bytes: int
     eof: bool
     content_encoding: str
-    target_seq: int | None = None
-    stream: str | None = None
-    offset: int | None = None
-    nbytes: int | None = None
+    target_seq: int
+    stream: str
+    offset: int
+    nbytes: int
     error_message: str | None = None
     kind: str = KIND_OUTPUT_READ_RESULT
 

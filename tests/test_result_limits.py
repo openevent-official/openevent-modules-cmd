@@ -59,7 +59,7 @@ class ResultLimitsTest(unittest.TestCase):
             self.assertFalse(worker.pending)
             self.assertFalse(worker.running)
 
-    def test_output_envelope_too_large_never_returns_unsendable_empty_success(self):
+    def test_output_failure_envelope_too_large_is_fatal_at_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / '1').mkdir()
@@ -70,7 +70,8 @@ class ResultLimitsTest(unittest.TestCase):
             ), RecordingClient())
             event = OutputReadEvent(2, 1, 1, CmdOutputReadRequest(target_seq=1, stream='stdout', offset=0, nbytes=1, ts_ms=1))
             with self.assertRaises(PublishFatal):
-                worker._build_output_read_result(event)
+                worker._handle_output_read_event(event)
+            self.assertFalse(worker.openevent_client.payloads)
 
     def test_installed_sdk_version_uses_packaging_semantics(self):
         for version in ('0.8.1', '0.11.0', '0.11.1rc1'):

@@ -1,10 +1,10 @@
-# Cmd Protocol cmd.v2
+# Cmd Protocol cmd.v3
 
 [中文版](CMD_PROTOCOL_cn.md)
 
 ## 1. Channel
 
-Cmd channels must set `protocol="cmd.v2"` and must not use public visibility.
+Cmd channels must set `protocol="cmd.v3"` and must not use public visibility.
 Both caller and worker principals must be channel members. Only one active
 worker may consume a channel at a time.
 
@@ -12,7 +12,9 @@ worker may consume a channel at a time.
 
 ## 2. Common Rules
 
-All payloads are UTF-8 JSON objects. Unknown fields are invalid. Common fields:
+The following rules apply only to Cmd messages. See the
+[runtime notes](CONFIGURATION.md#channel-requirements) for OpenEvent system messages.
+All Cmd payloads are UTF-8 JSON objects. Unknown fields are invalid. Common fields:
 
 - `kind`: required; one of the message types in this document's section headings.
 - `ts_ms`: required; a Unix millisecond timestamp set by the payload producer.
@@ -33,19 +35,22 @@ UTF-8, `content` is the decoded string; otherwise it is the base64 string of tho
 bytes. Both fields must appear together. Empty output uses `bytes=0`,
 `content_encoding="utf-8"`, and `content=""`.
 
-For an invalid payload with a recognizable request type, the worker writes the
-corresponding `status="REJECTED"` result; otherwise it logs the error and ignores
-the message. Every `REJECTED` result requires `error_message` to explain why.
-Worker error messages use at most 512 UTF-8 bytes, truncated at complete character
-boundaries.
+If a non-system message's payload cannot be decoded as a UTF-8 JSON object, or its
+message type or fields fail validation, the worker reports an error and exits.
+It neither skips the message nor writes a Cmd result for it. This applies to
+requests, accepted, and results during both normal consumption and startup
+recovery. See [runtime behavior](CONFIGURATION.md#recovery-and-exit) for exit and cleanup.
+
+The `error_message` for `START_FAILED`, `RECOVERY_FAILED`, and `READ_FAILED` uses
+at most 512 UTF-8 bytes, truncated at complete character boundaries.
 
 `max_payload_bytes` is the OpenEvent deployment's message payload limit; the
 reference implementation defaults to 16 MiB. All size limits in this document
 use the actual deployment value. See [configuration](CONFIGURATION.md#fields)
 for the worker's supported minimum. All accepted/result payloads are checked
-after encoding and before publication. Partial reads reduce their size as
-described in sections 8 and 9; other results that cannot fit cause the worker to
-fail and exit.
+after encoding and before publication. A partial read whose complete successful
+result cannot fit returns `READ_FAILED` under sections 8 and 9, without reducing
+the return size. Other results that cannot fit cause the worker to fail and exit.
 
 ## 3. `cmd.run.request`
 
@@ -118,9 +123,8 @@ completes unresolved requests with a failed result.
 - After accepted is confirmed, the worker checks the deadline again. If it
   expired during publication, no process starts and the result is `TIMEOUT`.
   Accepted therefore does not guarantee that the command has started.
-- Invalid requests, requests that expire before obtaining an execution slot,
-  and requests killed while pending receive `REJECTED`, `TIMEOUT`, and `KILLED`
-  run results respectively, without accepted.
+- Requests that expire before obtaining an execution slot and requests killed
+  while pending receive `TIMEOUT` and `KILLED` run results respectively, without accepted.
 
 ## 5. `cmd.run.result`
 
@@ -133,20 +137,19 @@ completes unresolved requests with a failed result.
   "exit_code": 0,
   "timeout_ms": 300000,
   "started_at_ms": 1710000000100,
-  "finished_at_ms": 1710000001200,
   "stdout": {"file": "2001/12345.stdout", "bytes": 6, "content_encoding": "utf-8", "content": "hello\n"},
   "stderr": {"file": "2001/12345.stderr", "bytes": 0, "content_encoding": "utf-8", "content": ""}
 }
 ```
 
-- `timeout_ms` is the effective timeout defined in section 3. It is required
-  except for `REJECTED` when no effective value can be determined.
+- `timeout_ms` is required and is the effective timeout defined in section 3.
   `RECOVERY_FAILED` uses the explicit request value or the current recovery default.
-- `finished_at_ms` is required: the time the worker writes the final run result.
-  `started_at_ms` appears only after the process actually starts.
+- The common `ts_ms` field is this result's creation time, not the actual command
+  exit time. `started_at_ms` is the actual process start time and appears only
+  after the process starts.
 - `exit_code` is the shell exit code and appears only for `SUCCESS` or `FAILED`.
 - `START_FAILED` and `RECOVERY_FAILED` require `error_message`.
-- Expiry before startup, a kill while pending, an invalid request, or startup
+- Expiry before startup, a kill while pending, or startup
   failure produces empty stdout/stderr objects. `RECOVERY_FAILED` uses existing
   output files, or empty output objects if the files are missing.
 
@@ -158,9 +161,8 @@ completes unresolved requests with a failed result.
 | `FAILED` | No worker timeout or kill-request termination; shell exit code is non-zero. |
 | `TIMEOUT` | Process killed on timeout, or request expired before startup. |
 | `KILLED` | Process killed by a kill request, or pending task removed from the queue. |
-| `START_FAILED` | Preparation or process startup failed, including output subdirectory/file creation, file opening, working directory access, or shell startup. |
+| `START_FAILED` | Startup failed, including output subdirectory/file creation, file opening, closing the worker's output file handles, working directory access, or shell startup. |
 | `RECOVERY_FAILED` | Startup scan found a historical run request with accepted but no final result and completed it with a failed result. |
-| `REJECTED` | Request payload is invalid or exceeds protocol/configuration limits; command was not executed. |
 
 ### 5.1 stdout/stderr Output Object
 
@@ -225,8 +227,8 @@ section 9.
 }
 ```
 
-`target_seq` must echo the request's valid value. If the original value is invalid
-or missing, `REJECTED` may omit the field.
+`target_seq` is required and must echo the request's value. This message has no
+`error_message` field.
 
 `status` values:
 
@@ -235,7 +237,6 @@ or missing, `REJECTED` may omit the field.
 | `KILL_SENT` | Target shell is still running; a kill signal was sent to its task process group. |
 | `REMOVED_PENDING` | Target had not started and was removed from the queue. |
 | `NOT_RUNNING` | No running or pending target can be terminated in this channel. Completed and nonexistent tasks are not distinguished. |
-| `REJECTED` | Request payload is invalid or exceeds protocol/configuration limits; no kill signal was sent. |
 
 If the kill triggers termination first, the run result is `KILLED`; if a timeout
 already triggered, it remains `TIMEOUT`. When removing a pending task, the worker
@@ -251,8 +252,8 @@ established `TIMEOUT`/`KILLED`; otherwise the shell exit code selects
 
 ## 8. `cmd.output.read.request`
 
-Reads part of the worker-local `output_dir/<channel_id>/<target_seq>.stdout` or
-`.stderr` without changing task state.
+Reads the exact requested byte range from the worker-local
+`output_dir/<channel_id>/<target_seq>.stdout` or `.stderr` without changing task state.
 
 ```json
 {
@@ -261,17 +262,21 @@ Reads part of the worker-local `output_dir/<channel_id>/<target_seq>.stdout` or
   "target_seq": 12345,
   "stream": "stdout",
   "offset": 0,
-  "nbytes": 1024
+  "nbytes": 6
 }
 ```
 
 - `target_seq` is required: the target `cmd.run.request`'s OpenEvent `seq`.
 - `stream` is required: `stdout` or `stderr`.
 - `offset` is required: a non-negative integer byte offset at which reading starts.
-- `nbytes` is required: a positive integer maximum byte count for this read.
-- If JSON and any required base64 encoding would exceed the deployment payload
-  limit, the worker must reduce the read size. Returned `bytes` may be smaller
-  than `nbytes`; callers continue at `offset + bytes`.
+- `nbytes` is required: a positive integer specifying the exact byte count to
+  read. The requested range is `[offset, offset + nbytes)`.
+- The worker must return the complete range without reducing the read size or
+  returning partial content. If the range exceeds the initial file size obtained
+  after opening, fewer than `nbytes` bytes are actually read, or the complete result
+  exceeds the deployment payload limit after JSON and any required base64 encoding,
+  it returns `READ_FAILED` with an explanation. An empty file or an `offset` at or
+  beyond the file end also returns `READ_FAILED`.
 - Any channel member can read that channel's output. A `target_seq` in another
   channel returns `NOT_FOUND`; the worker does not look across channels.
 
@@ -286,7 +291,7 @@ Reads part of the worker-local `output_dir/<channel_id>/<target_seq>.stdout` or
   "status": "SUCCESS",
   "stream": "stdout",
   "offset": 0,
-  "nbytes": 1024,
+  "nbytes": 6,
   "bytes": 6,
   "eof": true,
   "content_encoding": "utf-8",
@@ -294,14 +299,14 @@ Reads part of the worker-local `output_dir/<channel_id>/<target_seq>.stdout` or
 }
 ```
 
-- `target_seq`, `stream`, `offset`, and `nbytes` must echo valid values from the
-  request. `REJECTED` may omit fields whose original values are invalid or missing.
-- `status`, `content`, and `content_encoding` are required. `bytes` counts the raw
-  bytes returned, or 0 when nothing was read.
-- After opening the file, the worker obtains its initial size. `eof` is
-  `offset + bytes >= initial file size`, including when the returned amount was
-  reduced. `eof=true` does not guarantee a running task will not append more output.
-- If `offset` is at the file end, the result has empty content, `bytes=0`, and `eof=true`.
+- `target_seq`, `stream`, `offset`, and `nbytes` are required and must echo the
+  request's values.
+- `status`, `content`, and `content_encoding` are required. On success, `bytes`
+  must equal the requested `nbytes`, and decoding `content` must produce all raw
+  bytes in the requested range.
+- After opening the file, the worker obtains its initial size. On success, `eof`
+  is `offset + nbytes == initial file size`. `eof=true` does not guarantee a running
+  task will not append more output.
 
 `status` values and failure fields:
 
@@ -309,12 +314,11 @@ Reads part of the worker-local `output_dir/<channel_id>/<target_seq>.stdout` or
 | --- | --- | --- | --- |
 | `SUCCESS` | Read succeeded. | As defined above | — |
 | `NOT_FOUND` | Target output file does not exist. | `true` | — |
-| `READ_FAILED` | File exists but cannot be statted, opened, or read. | `false` | Required |
-| `REJECTED` | Request payload is invalid or exceeds protocol/configuration limits; file was not read. | `true` | Required |
+| `READ_FAILED` | File exists but cannot be statted, opened, or read, or the exact range or message size requirements in section 8 cannot be met. | `false` | Required |
 
-The last three statuses use `content=""`, `bytes=0`, and `content_encoding="utf-8"`.
+The last two statuses use `content=""`, `bytes=0`, and `content_encoding="utf-8"`.
 
 ## 10. Versioning Policy
 
-This package implements `cmd.v2`. It requires channels and callers using this protocol.
-Breaking changes must use a new protocol, such as `cmd.v3`.
+This package implements `cmd.v3`. It requires channels and callers using this protocol.
+Breaking changes must use a new protocol, such as `cmd.v4`.

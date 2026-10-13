@@ -172,7 +172,7 @@ class CmdEndToEndTest(unittest.TestCase):
     def create_channel(self, name, description=""):
         return self.client.create_channel(
             self.requester, self.token, name,
-            visibility=openevent_pb2.VISIBILITY_PRIVATE, protocol="cmd.v2",
+            visibility=openevent_pb2.VISIBILITY_PRIVATE, protocol="cmd.v3",
             description=description, members=[self.worker_principal],
         ).channel.channel_id
 
@@ -216,7 +216,8 @@ class CmdEndToEndTest(unittest.TestCase):
             response = self.client.fetch(self.requester, self.token, from_seq=cursor, limit=1000)
             if last_seq is None:
                 last_seq = response.last_seq
-            result.extend(parse_message(item) for item in response.messages if item.seq <= last_seq)
+            result.extend(parse_message(item) for item in response.messages
+                          if item.seq <= last_seq and item.principal != 0)
             self.assertGreater(response.next_seq, cursor)
             cursor = response.next_seq
         return result
@@ -355,7 +356,7 @@ class CmdEndToEndTest(unittest.TestCase):
         self.assertEqual(result.timeout_ms, 1000)
         self.assertIsNotNone(result.started_at_ms)
 
-    def test_binary_output_is_read_in_bounded_chunks(self):
+    def test_binary_output_requires_exact_ranges(self):
         self.start_worker()
         command = shlex.join([sys.executable, "-B", "-c", "import os; os.write(1, bytes(range(256)) * 256)"])
         seq = self.run_command(command)
@@ -363,22 +364,38 @@ class CmdEndToEndTest(unittest.TestCase):
         self.assertEqual(result.status, "SUCCESS")
         self.assertEqual(result.stdout.bytes, 65536)
         self.assertIsNone(result.stdout.content)
+        for offset, nbytes in (
+            (0, 65536),  # Raw bytes already exceed the payload limit.
+            (0, 12288),  # Base64 plus the response fields exceed it.
+            (65535, 2),  # Only part of the requested range exists.
+            (65536, 1),
+            (65537, 1),
+        ):
+            with self.subTest(offset=offset, nbytes=nbytes):
+                failed = self.read_output(seq, offset, nbytes)
+                self.assertEqual(failed.status, "READ_FAILED")
+                self.assertEqual(failed.bytes, 0)
+                self.assertEqual(failed.content, "")
+                self.assertEqual(failed.content_encoding, "utf-8")
+                self.assertFalse(failed.eof)
+                self.assertTrue(failed.error_message)
+                self.assertEqual(failed.offset, offset)
+                self.assertEqual(failed.nbytes, nbytes)
         output = bytearray()
         while len(output) < result.stdout.bytes:
-            part = self.read_output(seq, len(output), result.stdout.bytes)
+            nbytes = min(4096, result.stdout.bytes - len(output))
+            part = self.read_output(seq, len(output), nbytes)
             self.assertEqual(part.status, "SUCCESS")
             self.assertEqual(part.content_encoding, "base64")
             raw = decoded(part)
-            self.assertEqual(part.bytes, len(raw))
-            self.assertGreater(part.bytes, 0)
-            self.assertLess(part.bytes, 16384)
+            self.assertEqual(part.bytes, nbytes)
+            self.assertEqual(len(raw), nbytes)
             output.extend(raw)
             self.assertEqual(part.eof, len(output) == result.stdout.bytes)
         self.assertEqual(output, bytes(range(256)) * 256)
-        after_end = self.read_output(seq, 65537, 1)
-        self.assertEqual(after_end.status, "SUCCESS")
-        self.assertEqual(decoded(after_end), b"")
-        self.assertTrue(after_end.eof)
+        followup = self.run_command("printf ready")
+        self.assertEqual(self.reply("cmd.run.result", followup).payload.status, "SUCCESS")
+        self.assertEqual(decoded(self.read_output(followup, 0, 5)), b"ready")
 
     def test_channel_scoping_for_requests_kill_and_output(self):
         second = self.create_channel("second")

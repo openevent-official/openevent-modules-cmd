@@ -37,7 +37,7 @@ fetch_error_retry_sleep_ms: 1000
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
 | `open_event.addr` | yes | none | OpenEvent server address. |
-| `open_event.max_payload_bytes` | no | `16777216` | OpenEvent deployment payload size limit. Must be an integer of at least `16384` (16 KiB). Every accepted/result payload is checked before publication; partial reads reduce their return size to fit. |
+| `open_event.max_payload_bytes` | no | `16777216` | OpenEvent deployment payload size limit. Must be an integer of at least `16384` (16 KiB). Every accepted/result payload is checked before publication; an oversized partial-read result returns failure under the [protocol](CMD_PROTOCOL.md#8-cmdoutputreadrequest). |
 | `principal` | yes | none | OpenEvent principal used by cmd-worker. Must be a positive integer. |
 | `token` | yes | none | OpenEvent token used by cmd-worker. Must be a non-empty string. |
 | `channel_ids` | yes | none | Channel ids handled by the worker. Must be a non-empty array of distinct positive integers. |
@@ -57,6 +57,12 @@ Every channel listed in `channel_ids` must satisfy the
 protocol, visibility, and worker membership for every channel;
 any failure stops startup.
 
+Channels also contain OpenEvent system messages, such as initialization and
+membership changes, identified by top-level `principal=0`. During both normal
+consumption and startup recovery, the worker skips them before parsing Cmd
+payloads and advances the scan cursor normally. It does not treat them as invalid
+Cmd requests, log payload errors, or publish Cmd results for them.
+
 ## Runtime Notes
 
 - `output_dir` may be relative or absolute. Relative paths are resolved against
@@ -75,6 +81,10 @@ any failure stops startup.
 Each command starts a shell as the leader of a separate process group. After the
 shell exits, the worker first sends SIGKILL to that group to clean up remaining
 members, then reaps the shell and completes the task.
+
+If startup fails after process creation, for example while closing output files,
+the worker also terminates the same process group and reaps the shell before
+reporting the error.
 
 Group cleanup after natural exit does not change the result to KILLED; the shell
 exit code still determines the result. An already established timeout or kill
@@ -106,14 +116,19 @@ When a run request omits `timeout_ms`, recovery uses the current
 An explicit request timeout keeps its original value.
 
 Fetch RPC errors are retried as configured above; exhaustion makes the worker exit.
-The worker also exits when accepted/result publication fails definitively or remains
-unconfirmed after retry. Ordinary program and stop exceptions propagate directly
-instead of entering RPC retries.
+The worker also reports an error and exits when accepted/result publication fails
+definitively or remains unconfirmed after retry, or when message decoding or
+validation fails under the [protocol rules](CMD_PROTOCOL.md#2-common-rules).
+Ordinary program and stop exceptions propagate directly instead of entering RPC retries.
 These exit paths, Ctrl+C, and SIGTERM clean up the current worker's unfinished
 tasks and reap their shells as defined in [Task Process Lifecycle](#task-process-lifecycle).
 Requests without final results are handled by recovery at the next startup.
 SIGINT/SIGTERM received during cleanup do not interrupt cleanup of the remaining tasks.
 When a stop signal triggers exit, the CLI preserves the exit code corresponding to the first stop signal.
+
+After a message decoding or validation failure, restart still scans history from
+the beginning. Encountering the same invalid message causes another error and
+exit; the worker does not automatically skip it.
 
 Forced worker termination or host failure cannot guarantee process cleanup.
 Recovery does not terminate OS processes left by historical workers or guarantee

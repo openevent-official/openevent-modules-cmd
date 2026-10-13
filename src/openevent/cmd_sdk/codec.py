@@ -68,16 +68,6 @@ def loads_payload(payload: bytes) -> dict[str, Any]:
     return validate_payload_dict(data)
 
 
-def identify_kind(payload: bytes) -> str | None:
-    try:
-        data = json.loads(payload.decode("utf-8"))
-    except Exception:
-        return None
-    if isinstance(data, dict) and isinstance(data.get("kind"), str):
-        return data["kind"]
-    return None
-
-
 def run_request_input_to_dict(req: CmdRunRequestInput) -> dict[str, Any]:
     data: dict[str, Any] = {
         "kind": KIND_RUN_REQUEST,
@@ -101,12 +91,10 @@ def run_result_input_to_dict(result: CmdRunResultInput) -> dict[str, Any]:
         "prev_seq": result.prev_seq,
         "ts_ms": result.ts_ms if result.ts_ms is not None else now_ms(),
         "status": result.status,
-        "finished_at_ms": result.finished_at_ms,
         "stdout": output_to_dict(result.stdout),
         "stderr": output_to_dict(result.stderr),
+        "timeout_ms": result.timeout_ms,
     }
-    if result.timeout_ms is not None:
-        data["timeout_ms"] = result.timeout_ms
     if result.started_at_ms is not None:
         data["started_at_ms"] = result.started_at_ms
     if result.exit_code is not None:
@@ -121,17 +109,13 @@ def kill_request_input_to_dict(req: CmdKillRequestInput) -> dict[str, Any]:
 
 
 def kill_result_input_to_dict(result: CmdKillResultInput) -> dict[str, Any]:
-    data: dict[str, Any] = {
+    return {
         "kind": KIND_KILL_RESULT,
         "prev_seq": result.prev_seq,
         "ts_ms": result.ts_ms if result.ts_ms is not None else now_ms(),
         "status": result.status,
+        "target_seq": result.target_seq,
     }
-    if result.target_seq is not None:
-        data["target_seq"] = result.target_seq
-    if result.error_message is not None:
-        data["error_message"] = result.error_message
-    return data
 
 
 def output_read_request_input_to_dict(req: CmdOutputReadRequestInput) -> dict[str, Any]:
@@ -155,11 +139,13 @@ def output_read_result_input_to_dict(result: CmdOutputReadResultInput) -> dict[s
         "eof": result.eof,
         "content_encoding": result.content_encoding,
         "content": result.content,
+        "target_seq": result.target_seq,
+        "stream": result.stream,
+        "offset": result.offset,
+        "nbytes": result.nbytes,
     }
-    for key in ("target_seq", "stream", "offset", "nbytes", "error_message"):
-        value = getattr(result, key)
-        if value is not None:
-            data[key] = value
+    if result.error_message is not None:
+        data["error_message"] = result.error_message
     return data
 
 
@@ -188,9 +174,8 @@ def dict_to_model(data: dict[str, Any]):
             prev_seq=data["prev_seq"],
             ts_ms=data["ts_ms"],
             status=data["status"],
-            timeout_ms=data.get("timeout_ms"),
+            timeout_ms=data["timeout_ms"],
             started_at_ms=data.get("started_at_ms"),
-            finished_at_ms=data["finished_at_ms"],
             exit_code=data.get("exit_code"),
             stdout=dict_to_output(data["stdout"]),
             stderr=dict_to_output(data["stderr"]),
@@ -199,7 +184,7 @@ def dict_to_model(data: dict[str, Any]):
     if kind == KIND_KILL_REQUEST:
         return CmdKillRequest(target_seq=data["target_seq"], ts_ms=data["ts_ms"])
     if kind == KIND_KILL_RESULT:
-        return CmdKillResult(prev_seq=data["prev_seq"], target_seq=data.get("target_seq"), ts_ms=data["ts_ms"], status=data["status"], error_message=data.get("error_message"))
+        return CmdKillResult(prev_seq=data["prev_seq"], target_seq=data["target_seq"], ts_ms=data["ts_ms"], status=data["status"])
     if kind == KIND_OUTPUT_READ_REQUEST:
         return CmdOutputReadRequest(
             target_seq=data["target_seq"],
@@ -213,10 +198,10 @@ def dict_to_model(data: dict[str, Any]):
             prev_seq=data["prev_seq"],
             ts_ms=data["ts_ms"],
             status=data["status"],
-            target_seq=data.get("target_seq"),
-            stream=data.get("stream"),
-            offset=data.get("offset"),
-            nbytes=data.get("nbytes"),
+            target_seq=data["target_seq"],
+            stream=data["stream"],
+            offset=data["offset"],
+            nbytes=data["nbytes"],
             bytes=data["bytes"],
             eof=data["eof"],
             content_encoding=data["content_encoding"],
@@ -260,7 +245,6 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
                 "exit_code",
                 "timeout_ms",
                 "started_at_ms",
-                "finished_at_ms",
                 "stdout",
                 "stderr",
                 "error_message",
@@ -268,11 +252,10 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         )
         _require_positive_int(data, "prev_seq")
         status = _require_enum(data, "status", RUN_STATUSES)
-        _require_non_negative_int(data, "finished_at_ms")
         if "timeout_ms" in data:
             _require_timeout_ms(data)
-        elif status != "REJECTED":
-            raise CmdSDKError("MISSING_TIMEOUT", "timeout_ms is required unless status is REJECTED")
+        else:
+            raise CmdSDKError("MISSING_TIMEOUT", "timeout_ms is required")
         if "started_at_ms" in data:
             _require_non_negative_int(data, "started_at_ms")
         if "exit_code" in data and not isinstance(data["exit_code"], int):
@@ -282,7 +265,7 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
                 raise CmdSDKError("MISSING_EXIT_CODE", "exit_code is required for SUCCESS or FAILED")
         elif "exit_code" in data:
             raise CmdSDKError("INVALID_EXIT_CODE", "exit_code is only valid for SUCCESS or FAILED")
-        if status in {"REJECTED", "START_FAILED", "RECOVERY_FAILED"}:
+        if status in {"START_FAILED", "RECOVERY_FAILED"}:
             _require_non_empty_str(data, "error_message")
         if "stdout" not in data or "stderr" not in data:
             raise CmdSDKError("MISSING_OUTPUT", "stdout and stderr are required")
@@ -292,13 +275,10 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         _reject_unknown(data, {"kind", "ts_ms", "target_seq"})
         _require_positive_int(data, "target_seq")
     elif kind == KIND_KILL_RESULT:
-        _reject_unknown(data, {"kind", "ts_ms", "prev_seq", "target_seq", "status", "error_message"})
+        _reject_unknown(data, {"kind", "ts_ms", "prev_seq", "target_seq", "status"})
         _require_positive_int(data, "prev_seq")
-        status = _require_enum(data, "status", KILL_STATUSES)
-        if "target_seq" in data:
-            _require_positive_int(data, "target_seq")
-        if status == "REJECTED":
-            _require_non_empty_str(data, "error_message")
+        _require_enum(data, "status", KILL_STATUSES)
+        _require_positive_int(data, "target_seq")
     elif kind == KIND_OUTPUT_READ_REQUEST:
         _reject_unknown(data, {"kind", "ts_ms", "target_seq", "stream", "offset", "nbytes"})
         _require_positive_int(data, "target_seq")
@@ -326,14 +306,10 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         )
         _require_positive_int(data, "prev_seq")
         status = _require_enum(data, "status", OUTPUT_READ_STATUSES)
-        if "target_seq" in data:
-            _require_positive_int(data, "target_seq")
-        if "stream" in data:
-            _require_enum(data, "stream", OUTPUT_STREAMS)
-        if "offset" in data:
-            _require_non_negative_int(data, "offset")
-        if "nbytes" in data:
-            _require_positive_int(data, "nbytes")
+        _require_positive_int(data, "target_seq")
+        _require_enum(data, "stream", OUTPUT_STREAMS)
+        _require_non_negative_int(data, "offset")
+        _require_positive_int(data, "nbytes")
         _require_non_negative_int(data, "bytes")
         if not isinstance(data.get("eof"), bool):
             raise CmdSDKError("INVALID_EOF", "eof must be a boolean")
@@ -341,11 +317,13 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         if not isinstance(data.get("content"), str):
             raise CmdSDKError("INVALID_CONTENT", "content must be a string")
         _validate_content_size(data["content_encoding"], data["content"], data["bytes"], "content")
+        if status == "SUCCESS" and data["bytes"] != data["nbytes"]:
+            raise CmdSDKError("INVALID_OUTPUT_READ_RESULT", "SUCCESS must return exactly nbytes bytes")
         if status == "NOT_FOUND":
             _require_empty_output_read_result(data, eof=True, status=status)
-        if status in {"READ_FAILED", "REJECTED"}:
+        if status == "READ_FAILED":
             _require_non_empty_str(data, "error_message")
-            _require_empty_output_read_result(data, eof=status == "REJECTED", status=status)
+            _require_empty_output_read_result(data, eof=False, status=status)
     return data
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import signal
 import subprocess
@@ -12,11 +13,11 @@ import unittest
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from openevent.cmd_sdk.model import CmdKillRequest, CmdRunRequest
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
-from openevent.cmd_worker.runner import CommandRunner, now_ms
+from openevent.cmd_worker.runner import CommandRunner, CommandStartError, now_ms
 from openevent.cmd_worker.worker import ActiveRun, CmdWorker, KillEvent, RunEvent
 
 
@@ -116,6 +117,154 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
         self.assertFalse(self.runner.terminate(task, "TIMEOUT"))
         self.assertEqual(self.runner.wait(task), return_code)
         self.assertEqual(killpg.call_count, call_count)
+
+    def test_output_close_failure_cleans_group_before_start_failed(self):
+        for stream in ("stdout", "stderr"):
+            for leader_exits in (False, True):
+                with self.subTest(stream=stream, leader_exits=leader_exits):
+                    self._assert_start_failure_cleanup(close_stream=stream, leader_exits=leader_exits)
+
+    def test_task_construction_base_exception_cleans_group_and_propagates(self):
+        class ConstructionAborted(BaseException):
+            pass
+
+        self._assert_start_failure_cleanup(construction_error=ConstructionAborted("interrupted construction"))
+
+    def test_popen_failure_does_not_signal_an_uncreated_process(self):
+        with (
+            patch("openevent.cmd_worker.runner.subprocess.Popen", side_effect=OSError(errno.EIO, "cannot start shell")),
+            patch("openevent.cmd_worker.runner.os.killpg") as killpg,
+        ):
+            with self.assertRaisesRegex(CommandStartError, "cannot start shell"):
+                self.runner.start(2001, 1, "true", None, 30000, now_ms() + 30000)
+        killpg.assert_not_called()
+
+    def _assert_start_failure_cleanup(self, *, close_stream=None, leader_exits=False, construction_error=None):
+        worker = CmdWorker(CmdWorkerConfig(
+            open_event=OpenEventConfig("127.0.0.1:9527"),
+            principal=30001, token="token", channel_ids=(2001,),
+            output_dir=self.runner.output_dir,
+        ), object())
+        worker.runner = self.runner
+        original_open = Path.open
+        original_popen = subprocess.Popen
+        original_killpg = os.killpg
+        processes = []
+        reported_children = []
+        failures = []
+        output = self.runner.output_dir / "2001/1.stdout"
+        command = 'sleep 30 & printf "%s\\n" "$!"; ' + ("exit 7" if leader_exits else "wait")
+
+        def before_failure():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with original_open(output, "r") as reader:
+                    text = reader.read().strip()
+                if text:
+                    child = int(text)
+                    self.children.add(child)
+                    reported_children.append(child)
+                    break
+                time.sleep(0.005)
+            else:
+                self.fail("shell did not report its background child before startup failure")
+            process = processes[0]
+            self._assert_child_running(child)
+            self.assertEqual(os.getpgid(child), process.pid)
+            if leader_exits:
+                self.assertEqual(self._observe_leader_exit(SimpleNamespace(process=process)).si_status, 7)
+            else:
+                self.assertIsNone(os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+            failures.append(True)
+
+        class FailingOutput:
+            def __init__(self, path, handle):
+                self.path = path
+                self.handle = handle
+
+            def __enter__(self):
+                return self.handle.__enter__()
+
+            def __exit__(self, *args):
+                result = self.handle.__exit__(*args)
+                if self.path.suffix == "." + str(close_stream) and not failures:
+                    before_failure()
+                    raise OSError(errno.EIO, "injected output close failure", str(self.path))
+                return result
+
+        def open_output(path, *args, **kwargs):
+            return FailingOutput(path, original_open(path, *args, **kwargs))
+
+        def start_process(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def abort_construction(*args, **kwargs):
+            before_failure()
+            raise construction_error
+
+        def inspect_then_signal(pgid, signum):
+            process = processes[0]
+            # The leader must not have been reaped before signalling its group.
+            observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if leader_exits:
+                self.assertEqual(observed.si_status, 7)
+            self.assertEqual((pgid, signum), (process.pid, signal.SIGKILL))
+            return original_killpg(pgid, signum)
+
+        def assert_reaped():
+            process = processes[0]
+            self.assertEqual(process.returncode, 7 if leader_exits else -signal.SIGKILL)
+            with self.assertRaises(ChildProcessError):
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            self.assertEqual(os.waitstatus_to_exitcode(self._reap_child(reported_children[0])), -signal.SIGKILL)
+
+        def record_failure(channel_id, request_principal, result):
+            self.assertEqual((channel_id, request_principal), (2001, 1001))
+            self.assertEqual(result.status, "START_FAILED")
+            self.assertIn("injected output close failure", result.error_message)
+            assert_reaped()
+
+        worker.publisher = SimpleNamespace(
+            publish_run_accepted=Mock(), publish_run_result=Mock(side_effect=record_failure),
+        )
+        try:
+            with (
+                patch.object(Path, "open", open_output),
+                patch("openevent.cmd_worker.runner.subprocess.Popen", side_effect=start_process),
+                patch("openevent.cmd_worker.runner.os.killpg", side_effect=inspect_then_signal) as killpg,
+            ):
+                timestamp = now_ms()
+                event = RunEvent(1, 2001, 1001, timestamp, CmdRunRequest(
+                    command=command, timeout_ms=30000, ts_ms=timestamp,
+                ))
+                if construction_error is not None:
+                    with patch("openevent.cmd_worker.runner.RunningCommand", side_effect=abort_construction):
+                        with self.assertRaises(type(construction_error)) as raised:
+                            worker._start_or_timeout(event)
+                    self.assertIs(raised.exception, construction_error)
+                    worker.publisher.publish_run_result.assert_not_called()
+                    assert_reaped()
+                else:
+                    worker._start_or_timeout(event)
+                    worker.publisher.publish_run_result.assert_called_once()
+                killpg.assert_called_once()
+                worker.publisher.publish_run_accepted.assert_called_once_with(2001, 1001, 1)
+                self.assertEqual(len(failures), 1)
+                self.assertFalse(worker.running)
+                self.assertFalse(worker.starting_command)
+        finally:
+            for process in processes:
+                try:
+                    os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                except ChildProcessError:
+                    continue
+                try:
+                    original_killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
 
     def test_natural_exit_cleans_background_before_reaping_and_preserves_status(self):
         for exit_code, method in ((0, "poll"), (7, "wait")):

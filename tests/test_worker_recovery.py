@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from openevent.cmd_sdk.model import KIND_KILL_RESULT, KIND_OUTPUT_READ_RESULT, KIND_RUN_RESULT
 from openevent.cmd_worker.config import CmdWorkerConfig, OpenEventConfig
-from openevent.cmd_worker.worker import CmdWorker, CompletionEvent, InvalidRequestEvent
+from openevent.cmd_worker.worker import CmdWorker, CompletionEvent
 
 from test_worker_lifecycle import FakeClient, RecordingPublisher, message
 
@@ -32,7 +32,6 @@ class WorkerRecoveryTest(unittest.TestCase):
         result = message(4, {
             "kind": KIND_RUN_RESULT, "prev_seq": 1, "ts_ms": 1000,
             "status": "SUCCESS", "timeout_ms": 300000, "exit_code": 0,
-            "finished_at_ms": 1001,
             "stdout": {"file": "2001/1.stdout", "bytes": 0, "content_encoding": "utf-8", "content": ""},
             "stderr": {"file": "2001/1.stderr", "bytes": 0, "content_encoding": "utf-8", "content": ""},
         }, 30001)
@@ -111,12 +110,8 @@ class WorkerRecoveryTest(unittest.TestCase):
                            "target_seq": 99, "stream": "stdout", "offset": 0, "nbytes": 10,
                            "status": "NOT_FOUND", "content": "", "bytes": 0,
                            "eof": True, "content_encoding": "utf-8"}, 30001),
-            item(13, 2002, _run_result(4, 2002, "REJECTED"), 30001),
+            item(13, 2002, _run_result(4, 2002, "START_FAILED"), 30001),
         ]
-        # One malformed request has a persisted rejection; another still
-        # needs a reply. Both retain their recognizable request kinds.
-        history[3].payload = b'{"kind":"cmd.run.request","ts_ms":1000}'
-        history[7].payload = b'{"kind":"cmd.output.read.request","ts_ms":1000}'
         client = FakeClient()
         client.fetch = Mock(side_effect=[
             SimpleNamespace(messages=history[:4], next_seq=5, last_seq=13),
@@ -131,7 +126,6 @@ class WorkerRecoveryTest(unittest.TestCase):
 
         self.assertEqual([(event.channel_id, event.seq) for event in events],
                          [(2002, 5), (2001, 6), (2002, 7), (2001, 8)])
-        self.assertIsInstance(events[-1], InvalidRequestEvent)
         self.assertFalse(worker.pending)
         self.assertFalse(worker.running)
         self.assertFalse(recovery.accepted)
@@ -252,14 +246,12 @@ class WorkerRecoveryTest(unittest.TestCase):
 def _run_result(prev_seq, channel_id, status):
     payload = {
         "kind": KIND_RUN_RESULT, "prev_seq": prev_seq, "status": status,
-        "finished_at_ms": 1001, "error_message": "test failure",
+        "error_message": "test failure", "timeout_ms": 300000,
         "stdout": {"file": f"{channel_id}/{prev_seq}.stdout", "bytes": 0,
                    "content_encoding": "utf-8", "content": ""},
         "stderr": {"file": f"{channel_id}/{prev_seq}.stderr", "bytes": 0,
                    "content_encoding": "utf-8", "content": ""},
     }
-    if status != "REJECTED":
-        payload["timeout_ms"] = 300000
     return payload
 
 

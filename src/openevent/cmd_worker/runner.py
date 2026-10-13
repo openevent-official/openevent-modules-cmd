@@ -55,6 +55,7 @@ class CommandRunner:
             [{"object_id": int(key.object_id), "object_token": key.object_token} for key in object_keys],
             ensure_ascii=True, separators=(",", ":"),
         )
+        process = None
         try:
             with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
                 process = subprocess.Popen(
@@ -67,16 +68,26 @@ class CommandRunner:
                     start_new_session=True,
                     close_fds=True,
                 )
-        except (OSError, ValueError) as exc:
-            raise CommandStartError(f"cannot open output files or start shell process: {exc}") from exc
-        return RunningCommand(
-            channel_id=channel_id,
-            seq=seq,
-            process=process,
-            started_at_ms=now_ms(),
-            timeout_ms=timeout_ms,
-            deadline_ms=deadline_ms,
-        )
+            return RunningCommand(
+                channel_id=channel_id,
+                seq=seq,
+                process=process,
+                started_at_ms=now_ms(),
+                timeout_ms=timeout_ms,
+                deadline_ms=deadline_ms,
+            )
+        except BaseException as exc:
+            if process is not None:
+                # Until handoff, only start() owns this unreaped child. Signal
+                # its group before wait() can release the leader's PID/PGID.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if isinstance(exc, (OSError, ValueError)):
+                raise CommandStartError(f"cannot prepare output files or start shell process: {exc}") from exc
+            raise
 
     def poll(self, task: RunningCommand) -> int | None:
         with task.termination_lock:

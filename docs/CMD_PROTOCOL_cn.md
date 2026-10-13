@@ -1,17 +1,18 @@
-# Cmd 协议 cmd.v2
+# Cmd 协议 cmd.v3
 
 [English version](CMD_PROTOCOL.md)
 
 ## 1. 通道
 
-cmd 通道必须设置 `protocol="cmd.v2"`，不能使用 public visibility。调用方和 worker principal
+cmd 通道必须设置 `protocol="cmd.v3"`，不能使用 public visibility。调用方和 worker principal
 都必须是通道成员，同一通道同一时刻只能有一个有效 worker 消费。
 
 `description` 是可选的普通说明文字，可以为空；worker 不解析其内容。
 
 ## 2. 公共规则
 
-所有 payload 都是 UTF-8 JSON 对象，未知字段视为非法。公共字段：
+以下规则只适用于 Cmd 业务消息；OpenEvent 系统消息的处理见[运行说明](CONFIGURATION_cn.md#channel-要求)。
+所有 Cmd payload 都是 UTF-8 JSON 对象，未知字段视为非法。公共字段：
 
 - `kind`：必填，取值为本文各消息章节标题中的类型。
 - `ts_ms`：必填，payload 生成方写入的 Unix 毫秒时间戳。
@@ -28,14 +29,17 @@ cmd 通道必须设置 `protocol="cmd.v2"`，不能使用 public visibility。�
 字符串；否则写原始字节的 base64 字符串。两字段必须同时出现。空输出使用 `bytes=0`、
 `content_encoding="utf-8"`、`content=""`。
 
-非法 payload 能识别请求类型时，worker 写对应的 `status="REJECTED"` result；无法识别时，记录错误并忽略。
-所有 `REJECTED` result 必须用 `error_message` 说明原因。worker 的错误说明最多为 512 个 UTF-8 字节，
+非系统消息的 payload 无法解码为 UTF-8 JSON 对象，或消息类型、字段校验失败时，worker 报错退出，
+不跳过消息，也不为它写回 Cmd 结果。此规则同时适用于正常消费和启动恢复中的请求、accepted 和 result。
+退出与清理行为见[运行说明](CONFIGURATION_cn.md#恢复与退出)。
+
+`START_FAILED`、`RECOVERY_FAILED` 和 `READ_FAILED` 的 `error_message` 最多为 512 个 UTF-8 字节，
 超出时在完整字符边界截短。
 
 `max_payload_bytes` 指 OpenEvent 部署的消息 payload 大小上限，参考实现默认为 16 MiB；
 本文所有消息大小限制以实际部署值为准。worker 支持的最小值见[配置文档](CONFIGURATION_cn.md#字段)。
-所有 accepted/result 发布前检查最终编码大小；局部读取按第 8、9 节缩小返回量，其他无法容纳的结果
-导致 worker 报错退出。
+所有 accepted/result 发布前检查最终编码大小；局部读取的成功结果无法容纳时，按第 8、9 节返回
+`READ_FAILED`，不缩小返回量。其他无法容纳的结果导致 worker 报错退出。
 
 ## 3. `cmd.run.request`
 
@@ -91,8 +95,7 @@ worker 接手合法且未超时的运行请求时，必须先确认写入 accept
 
 - accepted 确认后再次检查超时；若发布期间截止时间已到，不启动进程，写 `TIMEOUT`。
   因此 accepted 不保证命令已经启动。
-- 请求非法、获得执行槽位前超时、或在队列中被 kill 时，不写 accepted，分别直接写
-  `REJECTED`、`TIMEOUT`、`KILLED` 运行结果。
+- 获得执行槽位前超时或在队列中被 kill 时，不写 accepted，分别直接写 `TIMEOUT`、`KILLED` 运行结果。
 
 ## 5. `cmd.run.result`
 
@@ -105,18 +108,18 @@ worker 接手合法且未超时的运行请求时，必须先确认写入 accept
   "exit_code": 0,
   "timeout_ms": 300000,
   "started_at_ms": 1710000000100,
-  "finished_at_ms": 1710000001200,
   "stdout": {"file": "2001/12345.stdout", "bytes": 6, "content_encoding": "utf-8", "content": "hello\n"},
   "stderr": {"file": "2001/12345.stderr", "bytes": 0, "content_encoding": "utf-8", "content": ""}
 }
 ```
 
-- `timeout_ms` 是按第 3 节确定的有效超时；除 `REJECTED` 且无法确定有效值外必须出现。
+- `timeout_ms` 必填，是按第 3 节确定的有效超时。
   `RECOVERY_FAILED` 使用请求显式值或恢复时的当前默认值。
-- `finished_at_ms` 必填，是 worker 写出最终运行结果的时间；`started_at_ms` 只在进程实际启动后出现。
+- 公共字段 `ts_ms` 表示本条结果的生成时间，不表示命令实际结束时间。
+  `started_at_ms` 表示进程实际启动时间，只在进程实际启动后出现。
 - `exit_code` 是 shell 退出码，只在 `SUCCESS` 或 `FAILED` 时出现。
 - `START_FAILED`、`RECOVERY_FAILED` 必须写 `error_message`。
-- 启动前超时、队列中被 kill、请求非法或启动失败时，stdout/stderr 写空输出对象。
+- 启动前超时、队列中被 kill 或启动失败时，stdout/stderr 写空输出对象。
   `RECOVERY_FAILED` 按已有输出文件生成输出对象，文件不存在时写空输出对象。
 
 `status` 取值：
@@ -127,9 +130,8 @@ worker 接手合法且未超时的运行请求时，必须先确认写入 accept
 | `FAILED` | 未因 worker 超时或 kill 请求终止，shell 退出码非 0 |
 | `TIMEOUT` | 因超时杀掉进程，或启动前请求已经超时 |
 | `KILLED` | 因 kill 请求杀掉进程，或从队列删除未启动任务 |
-| `START_FAILED` | 启动准备或进程启动失败，包括输出子目录或文件无法创建、文件无法打开、工作目录无法进入、shell 无法启动 |
+| `START_FAILED` | 启动流程失败，包括输出子目录或文件无法创建、文件无法打开、worker 侧输出文件句柄关闭失败、工作目录无法进入、shell 无法启动 |
 | `RECOVERY_FAILED` | 启动扫描发现历史运行请求已有 accepted 但没有最终 result，补写失败 result |
-| `REJECTED` | 请求 payload 非法或超过协议/配置限制，未执行命令 |
 
 ### 5.1 stdout/stderr 输出对象
 
@@ -183,7 +185,7 @@ stdout 和 stderr 独立使用相同规则：
 }
 ```
 
-`target_seq` 必须回显原请求中的合法值；原值非法或缺失时，`REJECTED` 可以省略该字段。
+`target_seq` 必填，必须回显原请求中的值。本消息不包含 `error_message` 字段。
 
 `status` 取值：
 
@@ -192,7 +194,6 @@ stdout 和 stderr 独立使用相同规则：
 | `KILL_SENT` | 目标 shell 仍在运行，已向任务进程组发送 kill 信号 |
 | `REMOVED_PENDING` | 目标尚未启动，已从队列删除 |
 | `NOT_RUNNING` | 当前通道没有可终止的运行中或待执行目标，不区分已完成和从未存在 |
-| `REJECTED` | 请求 payload 非法或超过协议/配置限制，未发送 kill |
 
 kill 先触发终止时，运行结果为 `KILLED`；超时已先触发时保留 `TIMEOUT`。
 删除待执行任务时，先确认写入运行结果 `KILLED`，再写 `REMOVED_PENDING`。
@@ -204,7 +205,7 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 
 ## 8. `cmd.output.read.request`
 
-读取 worker 本地 `output_dir/<channel_id>/<target_seq>.stdout` 或 `.stderr` 的一段内容，不改变任务状态。
+精确读取 worker 本地 `output_dir/<channel_id>/<target_seq>.stdout` 或 `.stderr` 的指定字节范围，不改变任务状态。
 
 ```json
 {
@@ -213,16 +214,17 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
   "target_seq": 12345,
   "stream": "stdout",
   "offset": 0,
-  "nbytes": 1024
+  "nbytes": 6
 }
 ```
 
 - `target_seq` 必填，是目标 `cmd.run.request` 的 OpenEvent `seq`。
 - `stream` 必填，只能是 `stdout` 或 `stderr`。
 - `offset` 必填，是非负整数，表示读取起始字节位置。
-- `nbytes` 必填，是正整数，表示本次最多读取的字节数。
-- JSON 和必要的 base64 编码后若会超过部署的 payload 上限，worker 必须减少实际读取量。
-  返回的 `bytes` 可以小于 `nbytes`；调用方用 `offset + bytes` 继续读取。
+- `nbytes` 必填，是正整数，表示本次必须读取的精确字节数；请求范围为 `[offset, offset + nbytes)`。
+- worker 必须完整返回该范围，不得缩小读取量或返回部分内容。请求范围超过打开后取得的初始文件大小、
+  实际读取不足 `nbytes`，或完整结果经 JSON 和必要的 base64 编码后超过部署的 payload 上限时，
+  返回 `READ_FAILED` 并说明原因。文件为空，或 `offset` 已到达或超过文件末尾时，同样返回 `READ_FAILED`。
 - 同一通道的任何成员都可以读取该通道的输出。`target_seq` 指向其他通道时返回 `NOT_FOUND`，不跨通道查找。
 
 ## 9. `cmd.output.read.result`
@@ -236,7 +238,7 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
   "status": "SUCCESS",
   "stream": "stdout",
   "offset": 0,
-  "nbytes": 1024,
+  "nbytes": 6,
   "bytes": 6,
   "eof": true,
   "content_encoding": "utf-8",
@@ -244,12 +246,11 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 }
 ```
 
-- `target_seq`、`stream`、`offset`、`nbytes` 必须回显原请求中的合法值；原值非法或缺失时，
-  `REJECTED` 可以省略相应字段。
-- `status`、`content`、`content_encoding` 必填；`bytes` 是返回内容的原始字节数，未读取时为 0。
-- worker 打开文件后先取得当时的大小；`eof` 为 `offset + bytes >= 初始文件大小`。
-  缩小返回量也按此规则判断。`eof=true` 不保证运行中的任务以后不会追加输出。
-- `offset` 已到文件末尾时，返回空内容、`bytes=0`、`eof=true`。
+- `target_seq`、`stream`、`offset`、`nbytes` 必填，必须回显原请求中的值。
+- `status`、`content`、`content_encoding` 必填；成功时 `bytes` 必须等于请求的 `nbytes`，
+  `content` 解码后必须是请求范围内的完整原始字节。
+- worker 打开文件后先取得当时的大小；成功时 `eof` 为 `offset + nbytes == 初始文件大小`。
+  `eof=true` 不保证运行中的任务以后不会追加输出。
 
 `status` 取值及失败字段：
 
@@ -257,12 +258,11 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 | --- | --- | --- | --- |
 | `SUCCESS` | 读取成功 | 按上述规则 | — |
 | `NOT_FOUND` | 目标输出文件不存在 | `true` | — |
-| `READ_FAILED` | 文件存在但无法 stat、打开或读取 | `false` | 必填 |
-| `REJECTED` | 请求 payload 非法或超过协议/配置限制，未读取文件 | `true` | 必填 |
+| `READ_FAILED` | 文件存在但无法 stat、打开或读取，或无法满足第 8 节的精确范围及消息大小要求 | `false` | 必填 |
 
-后三种状态均写 `content=""`、`bytes=0`、`content_encoding="utf-8"`。
+后两种状态均写 `content=""`、`bytes=0`、`content_encoding="utf-8"`。
 
 ## 10. 版本策略
 
-本包实现 `cmd.v2`，通道和调用方须使用该协议。
-破坏性变更必须使用新协议，例如 `cmd.v3`。
+本包实现 `cmd.v3`，通道和调用方须使用该协议。
+破坏性变更必须使用新协议，例如 `cmd.v4`。

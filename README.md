@@ -2,7 +2,7 @@
 
 [中文版](README_cn.md)
 
-The OpenEvent Cmd module provides a `cmd.v2` SDK and a Linux command worker.
+The OpenEvent Cmd module provides a `cmd.v3` SDK and a Linux command worker.
 Messages run or terminate commands, store stdout/stderr in local files, publish
 results, and read byte ranges from output files.
 

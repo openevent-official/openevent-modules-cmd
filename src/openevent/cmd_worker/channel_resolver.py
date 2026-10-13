@@ -18,8 +18,8 @@ class ChannelResolver:
         for channel_id in sorted(self.channel_ids):
             response = self.openevent_client.get_channel(self.principal, self.token, channel_id)
             channel = response.channel
-            if channel.protocol != "cmd.v2":
-                raise ChannelValidationError(f"channel {channel_id} protocol must be cmd.v2")
+            if channel.protocol != "cmd.v3":
+                raise ChannelValidationError(f"channel {channel_id} protocol must be cmd.v3")
             if int(channel.visibility) == int(openevent_pb2.VISIBILITY_PUBLIC):
                 raise ChannelValidationError(f"channel {channel_id} must not be public")
             if self.principal not in {int(member) for member in channel.members}:

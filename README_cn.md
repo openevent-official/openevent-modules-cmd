@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-OpenEvent Cmd 模块提供 `cmd.v2` 协议 SDK 和 Linux 命令 worker：通过消息运行或终止命令，
+OpenEvent Cmd 模块提供 `cmd.v3` 协议 SDK 和 Linux 命令 worker：通过消息运行或终止命令，
 把 stdout/stderr 保存到本地文件，写回结果，并支持按字节范围查询输出。
 
 ## 运行前提

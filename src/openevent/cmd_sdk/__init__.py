@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .client import CmdProtocolClient, create_client, parse_message
-from .codec import dumps_payload, identify_kind, loads_payload
+from .codec import dumps_payload, loads_payload
 from .errors import CmdSDKError
 from .model import (
     KIND_KILL_REQUEST,
@@ -55,7 +55,6 @@ __all__ = [
     "ParsedMessage",
     "create_client",
     "dumps_payload",
-    "identify_kind",
     "loads_payload",
     "parse_message",
 ]
