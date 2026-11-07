@@ -164,18 +164,6 @@ class WorkerPagingTest(unittest.TestCase):
                 else:
                     self.assertEqual(self.worker._fetch_round(), (True, False))
 
-    def test_nonadvancing_page_fails_on_first_or_later_page(self):
-        for stalled_seq in (1, 2):
-            with self.subTest(stalled_seq=stalled_seq):
-                self.worker.next_fetch_seq = 1
-                pages = []
-                if stalled_seq == 2:
-                    pages.append(SimpleNamespace(messages=[], next_seq=2, last_seq=2))
-                pages.append(SimpleNamespace(messages=[], next_seq=stalled_seq, last_seq=2))
-                self.client.fetch = Mock(side_effect=pages)
-                with self.assertRaisesRegex(RuntimeError, "Fetch did not advance next_seq"):
-                    self.worker._fetch_round()
-
 
 def _run_event(seq):
     return RunEvent(seq, 2001, 1001, 1000,

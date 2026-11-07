@@ -383,6 +383,7 @@ class ProcessGroupLifecycleTest(unittest.TestCase):
         for reason, later_reason in (("KILLED", "TIMEOUT"), ("TIMEOUT", "KILLED")):
             with self.subTest(reason=reason):
                 task, child = self._start('sleep 30 & printf "%s\\n" "$!"; wait')
+                self.assertEqual(os.getpgid(task.process.pid), task.process.pid)
                 self._assert_child_running(child)
                 real_killpg = os.killpg
                 with patch("openevent.cmd_worker.runner.os.killpg", wraps=real_killpg) as killpg:

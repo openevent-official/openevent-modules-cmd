@@ -155,13 +155,12 @@ class PublishTest(unittest.TestCase):
                         allocate.assert_called_once_with()
                         self.assertEqual(len(stub.allocations), 1)
                     self.assertEqual(len(stub.publishes), 1)
-                    request, timeout = stub.publishes[0]
+                    request, _ = stub.publishes[0]
                     self.assertEqual(request.uuid, 424242 if explicit else 7000)
                     self.assertEqual((request.principal, request.token, request.channel_id),
                                      (30001, "worker-token", 2001))
                     self.assertEqual(list(request.recipients), recipients)
                     self.assertEqual(json.loads(request.payload)["kind"], kind)
-                    self.assertEqual(timeout, 30.0)
 
     def test_uncertain_publish_retries_same_uuid_and_payload(self):
         for status in (

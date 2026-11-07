@@ -8,7 +8,7 @@ OpenEvent Cmd 模块提供 `cmd.v3` 协议 SDK 和 Linux 命令 worker：通过�
 ## 运行前提
 
 - Linux，Python 3.10 或更高版本。
-- Python 环境已安装 `openevent-sdk>=0.11.1`。
+- Python 环境已安装 `openevent-sdk>=0.13.0`。
 - 已运行的 OpenEvent server，已配置通道、token 和成员；通道须满足[协议要求](docs/CMD_PROTOCOL_cn.md#1-通道)。
 
 命令直接在 worker 机器上通过 Linux shell 执行，不提供隔离、资源限额或审计。
@@ -24,6 +24,11 @@ make check-docs
 用 `PYTHON=/path/to/venv/bin/python` 选择安装和测试环境。`make install` 构建并替换本项目包，
 版本相同也会替换；只补齐缺失或版本不符的依赖。只构建时运行 `make build`。
 `make install` 和 `make e2e` 均可通过 `INSTALL_ARGS=--user` 使用用户目录安装。
+
+构建工具保存在 `build/tools-env/` 并重复使用；切换 `PYTHON` 或解释器版本变化时重建该环境。
+每次构建按 `pyproject.toml` 的构建依赖声明检查工具，只补齐缺失或版本不符的依赖，不自动升级已满足的工具。
+构建使用这一环境，不另外创建临时隔离环境；每次仍先清理旧发布产物，再从当前源码生成新 wheel。
+`make clean` 会一并删除工具环境。
 
 `make test` 运行单元及安装回归测试。端到端测试需要本次成功构建的 OpenEvent server：
 

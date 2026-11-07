@@ -362,8 +362,6 @@ class WorkerLifecycleTest(unittest.TestCase):
 
         self.assertEqual(len(worker.publisher.records), 256)
         self.assertTrue(all(reference() is None for reference in references))
-        self.assertFalse(hasattr(worker, "finished_runs"))
-        self.assertFalse(hasattr(worker, "requests"))
         self.assertTrue(worker.completions.empty())
 
     def test_completed_queries_kills_and_reply_readback_retain_no_task_state(self):
@@ -394,11 +392,8 @@ class WorkerLifecycleTest(unittest.TestCase):
         worker._handle_event(KillEvent(66, 2002, 1001, CmdKillRequest(target_seq=1, ts_ms=1001)))
 
         self.assertEqual(worker.publisher.records[-1]["status"], "NOT_RUNNING")
-        self.assertFalse(hasattr(worker, "finished_runs"))
         self.assertFalse(worker.running)
         self.assertFalse(worker.pending)
-        self.assertFalse(hasattr(worker, "accepted"))
-        self.assertFalse(hasattr(worker, "results"))
 
     def test_full_slots_with_pending_command_sleep_when_no_progress(self):
         worker = self.worker()

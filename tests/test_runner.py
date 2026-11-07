@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import errno
-import os
-import signal
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -122,20 +120,6 @@ class RunnerTest(unittest.TestCase):
             (Path(tmp) / "2001").write_text("not a directory", encoding="utf-8")
             with self.assertRaises(CommandStartError):
                 runner.start(2001, 123, "true", None, 10000, now_ms() + 10000)
-
-    def test_kill_process_group_stops_command_and_reports_signal_delivery(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            runner = CommandRunner(tmp)
-            runner.prepare_output_root()
-            task = runner.start(2001, 123, "exec sleep 30", None, 10000, now_ms() + 10000)
-            try:
-                self.assertEqual(os.getpgid(task.process.pid), task.process.pid)
-                self.assertTrue(runner.terminate(task, "KILLED"))
-                self.assertEqual(runner.wait(task, timeout=5), -signal.SIGKILL)
-                self.assertFalse(runner.terminate(task, "KILLED"))
-            finally:
-                runner.terminate(task, "KILLED")
-                runner.wait(task, timeout=5)
 
 
 if __name__ == "__main__":

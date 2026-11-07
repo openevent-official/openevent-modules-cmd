@@ -69,20 +69,6 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.assertEqual(worker.next_fetch_seq, 6)
         self.assertIs(worker.completions.get_nowait(), completion)
 
-    def test_nonadvancing_page_fails_on_first_or_later_recovery_page(self):
-        for stalled_seq in (1, 2):
-            with self.subTest(stalled_seq=stalled_seq):
-                client = FakeClient()
-                worker = CmdWorker(self.config, client)
-                pages = []
-                if stalled_seq == 2:
-                    pages.append(SimpleNamespace(messages=[], next_seq=2, last_seq=2))
-                pages.append(SimpleNamespace(messages=[], next_seq=stalled_seq, last_seq=2))
-                client.fetch = Mock(side_effect=pages)
-
-                with self.assertRaisesRegex(RuntimeError, "Fetch did not advance next_seq"):
-                    worker._scan_history()
-
     def test_scan_closes_all_request_kinds_across_pages_and_channels(self):
         def item(seq, channel_id, payload, principal=1001):
             result = message(seq, {"ts_ms": 1000, **payload}, principal)

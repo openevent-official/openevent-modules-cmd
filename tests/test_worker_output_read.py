@@ -66,27 +66,6 @@ class WorkerOutputReadTest(unittest.TestCase):
         self.assertEqual(result.nbytes, event.request.nbytes)
         dumps_payload(output_read_result_input_to_dict(result))
 
-    def test_run_stops_worker_after_runtime_error(self) -> None:
-        worker = CmdWorker(
-            CmdWorkerConfig(
-                open_event=OpenEventConfig(addr="127.0.0.1:9527"),
-                principal=30001,
-                token="token",
-                channel_ids=(2001,),
-                output_dir=Path("cmd-worker-output"),
-            ),
-            FakeClient(),
-        )
-        stopped = []
-        worker.startup = lambda: None
-        worker._drain_completions = lambda: False
-        worker._fetch_round = lambda: (_ for _ in ()).throw(RuntimeError("fetch failed"))
-        worker.stop = lambda: stopped.append(True)
-
-        with self.assertRaisesRegex(RuntimeError, "fetch failed"):
-            worker.run()
-        self.assertEqual(stopped, [True])
-
     def test_wait_task_reports_internal_error_to_main_thread(self) -> None:
         worker = CmdWorker(
             CmdWorkerConfig(

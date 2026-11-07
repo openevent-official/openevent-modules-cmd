@@ -19,7 +19,9 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1
 # Import the selected environment's installed SDK, never a workspace source tree.
 unset PYTHONPATH
 cd "$ROOT_DIR"
-"$PYTHON_BIN" -B -c 'from importlib.metadata import version; from packaging.version import Version; assert Version(version("openevent-sdk")) >= Version("0.11.1"), "openevent-sdk>=0.11.1 must be installed in PYTHON"'
+# Only this preflight loads the Cmd checkout's shared dependency checker.
+# The check runs in a child process; E2E still uses installed packages below.
+make check-sdk PYTHON="$PYTHON_BIN"
 
 # build.sh removes old project wheels before building; the installer replaces
 # only this project and reuses satisfied dependencies. A failed build stops here.

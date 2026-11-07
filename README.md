@@ -9,7 +9,7 @@ results, and read byte ranges from output files.
 ## Requirements
 
 - Linux and Python 3.10 or later.
-- `openevent-sdk>=0.11.1` installed in the Python environment.
+- `openevent-sdk>=0.13.0` installed in the Python environment.
 - A running OpenEvent server with channels, tokens, and membership configured.
   Channels must meet the [protocol requirements](docs/CMD_PROTOCOL.md#1-channel).
 
@@ -28,6 +28,12 @@ Select the installation and test environment with `PYTHON=/path/to/venv/bin/pyth
 `make install` builds and replaces this package, even at the same version, and
 installs only missing or incompatible dependencies. Use `make build` to build without installing.
 User installations are supported with `INSTALL_ARGS=--user` for `make install` and `make e2e`.
+
+Build tools are retained in `build/tools-env/` and reused; changing `PYTHON` or its interpreter version rebuilds that environment.
+Each build checks the build dependencies declared in `pyproject.toml`, installing only missing or incompatible requirements
+without upgrading tools that already satisfy them. Builds use this environment without creating another temporary isolated
+environment; each build still removes old release artifacts and creates a new wheel from the current source.
+`make clean` also removes the tool environment.
 
 `make test` runs unit and installation regression tests. End-to-end tests require
 an OpenEvent server from a successful current build:

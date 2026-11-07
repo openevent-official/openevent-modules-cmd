@@ -170,13 +170,15 @@ class CmdSDKTest(unittest.TestCase):
             "cmd.kill.result": (CmdKillResultInput, CmdKillResult),
             "cmd.output.read.result": (CmdOutputReadResultInput, CmdOutputReadResult),
         }
-        for data in _result_payloads():
+        payloads = {data["kind"]: data for data in _result_payloads()}
+        for kind, result_models in models.items():
+            data = payloads[kind]
             parsed = codec.dict_to_model(data)
             values = {field.name: getattr(parsed, field.name) for field in fields(parsed) if field.name != "kind"}
-            for model in models[data["kind"]]:
+            for model in result_models:
                 complete = model(**values)
-                for field in _REQUIRED_RESULT_FIELDS[data["kind"]]:
-                    with self.subTest(model=model.__name__, status=data["status"], missing=field):
+                for field in _REQUIRED_RESULT_FIELDS[kind]:
+                    with self.subTest(model=model.__name__, missing=field):
                         self.assertEqual(getattr(complete, field), data[field])
                         missing_field = {key: value for key, value in values.items() if key != field}
                         with self.assertRaisesRegex(TypeError, field):

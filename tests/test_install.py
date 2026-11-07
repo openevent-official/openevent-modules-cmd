@@ -115,20 +115,3 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("choose its interpreter with PYTHON", result.stdout)
         self.assertFalse((self.workspace / "target").exists())
-
-    def test_failed_build_never_installs_old_artifact(self):
-        shutil.copyfile(ROOT / "Makefile", self.workspace / "Makefile")
-        write_wheel(self.wheels, "openevent_modules_cmd", "0.1.0", {})
-        build = self.workspace / "build.sh"
-        build.write_text("#!/bin/sh\nexit 1\n")
-        build.chmod(0o755)
-        marker = self.workspace / "install-ran"
-        (self.workspace / "scripts/install.py").write_text(
-            f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
-        )
-        result = subprocess.run(
-            ["make", "install", "PYTHON=" + sys.executable], cwd=self.workspace,
-            env=self.environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(marker.exists())

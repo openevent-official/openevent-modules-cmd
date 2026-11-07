@@ -6,7 +6,10 @@ import re
 import sys
 from urllib.parse import unquote, urlsplit
 
+from packaging.requirements import Requirement
+
 from openevent.cmd_sdk import CmdSDKError, loads_payload
+from openevent.cmd_sdk.dependencies import SDK_REQUIREMENT
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +30,9 @@ def anchors(text):
 
 def main():
     errors = []
-    dependency = re.search(r'"(openevent-sdk>=[^"]+)"', (ROOT / "pyproject.toml").read_text()).group(1)
+    dependency = re.search(r'"(openevent-sdk[^"]*)"', (ROOT / "pyproject.toml").read_text()).group(1)
+    if Requirement(SDK_REQUIREMENT) != Requirement(dependency):
+        errors.append(f"SDK runtime check uses {SDK_REQUIREMENT}, expected {dependency} from pyproject.toml")
     documents = {path: path.read_text(encoding="utf-8") for pair in PAIRS for path in pair}
     links = 0
     protocol_examples = 0

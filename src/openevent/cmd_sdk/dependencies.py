@@ -2,14 +2,17 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from packaging.requirements import Requirement
 from packaging.version import InvalidVersion, Version
+
+SDK_REQUIREMENT = "openevent-sdk>=0.13.0"
 
 
 def require_sdk() -> None:
-    requirement = "openevent-sdk>=0.11.1"
+    requirement = Requirement(SDK_REQUIREMENT)
     try:
-        installed = version("openevent-sdk")
-        if Version(installed) >= Version("0.11.1"):
+        installed = version(requirement.name)
+        if requirement.specifier.contains(Version(installed), prereleases=True):
             return
     except (PackageNotFoundError, InvalidVersion):
         installed = "missing or invalid"

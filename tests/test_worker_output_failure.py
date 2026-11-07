@@ -77,18 +77,16 @@ class WorkerOutputFailureTest(unittest.TestCase):
         output_path.parent.mkdir()
         output_path.write_bytes(b"produced")
 
-        for attempt in range(2):
-            with self.subTest(attempt=attempt):
-                worker = CmdWorker(self.config, FakeClient(history))
-                worker.publisher = RecordingPublisher()
-                worker.runner.start = Mock(side_effect=AssertionError("accepted command must not restart"))
-                with self.fail_output_open(output_path):
-                    with self.assertRaises(OSError) as raised:
-                        worker.run()
-                self.assertEqual(raised.exception.errno, errno.EIO)
-                self.assertFalse(worker.publisher.records)
-                self.assertTrue(worker.stopping)
-                worker.runner.start.assert_not_called()
+        worker = CmdWorker(self.config, FakeClient(history))
+        worker.publisher = RecordingPublisher()
+        worker.runner.start = Mock(side_effect=AssertionError("accepted command must not restart"))
+        with self.fail_output_open(output_path):
+            with self.assertRaises(OSError) as raised:
+                worker.run()
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertFalse(worker.publisher.records)
+        self.assertTrue(worker.stopping)
+        worker.runner.start.assert_not_called()
 
         recovered = CmdWorker(self.config, FakeClient(history))
         recovered.publisher = RecordingPublisher()

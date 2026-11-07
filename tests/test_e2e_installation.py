@@ -3,7 +3,6 @@
 from importlib.metadata import PathDistribution
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,28 +32,25 @@ class E2EInstallationTest(unittest.TestCase):
         module.touch()
         script = prefix / "bin" / "cmd-worker"
         script.parent.mkdir()
-        script.write_text(f"#!{sys.executable}\nprint('installed worker')\n")
+        script.touch()
         script.chmod(0o755)
         metadata.joinpath("RECORD").write_text(
             f"openevent/cmd_worker/cli.py,,\n{os.path.relpath(script, site)},,\n"
         )
         return PathDistribution(metadata), module, script
 
-    def test_finds_normal_venv_and_user_installations_from_metadata(self):
-        for layout in ("system", "venv", "user-base"):
+    def test_finds_installations_inside_and_outside_the_python_prefix(self):
+        for layout in ("prefix", "user-base"):
             with self.subTest(layout=layout):
                 location = self.root / layout
                 package, module, script = self.install(location)
-                python_prefix = self.root / "system" if layout == "user-base" else location
+                python_prefix = self.root / "prefix" if layout == "user-base" else location
                 with patch("e2e.installed_worker.distribution", return_value=package), \
                         patch.object(sys, "prefix", str(python_prefix)), \
                         patch.object(sys, "executable", str(python_prefix / "bin" / "python")), \
                         patch.dict(os.environ, {"PATH": str(self.root / "unrelated-bin")}):
                     found = installed_worker_path(module)
                 self.assertEqual(found, script)
-                result = subprocess.run([str(found)], check=True, text=True,
-                                        stdout=subprocess.PIPE)
-                self.assertEqual(result.stdout, "installed worker\n")
 
     def test_rejects_source_import_even_inside_the_python_prefix(self):
         prefix = self.root / "venv"

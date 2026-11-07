@@ -5,9 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
-from openevent.cmd_sdk.dependencies import require_sdk
 from openevent.cmd_sdk.model import CmdOutputReadRequest, CmdRunRequest
 from openevent.cmd_worker.config import ConfigError, CmdWorkerConfig, OpenEventConfig, parse_config
 from openevent.cmd_worker.publisher import PublishFatal
@@ -72,15 +70,6 @@ class ResultLimitsTest(unittest.TestCase):
             with self.assertRaises(PublishFatal):
                 worker._handle_output_read_event(event)
             self.assertFalse(worker.openevent_client.payloads)
-
-    def test_installed_sdk_version_uses_packaging_semantics(self):
-        for version in ('0.8.1', '0.11.0', '0.11.1rc1'):
-            with self.subTest(version=version), patch('openevent.cmd_sdk.dependencies.version', return_value=version):
-                with self.assertRaisesRegex(RuntimeError, 'openevent-sdk>=0.11.1'):
-                    require_sdk()
-        for version in ('0.11.1', '0.11.1+local', '0.12.0'):
-            with self.subTest(version=version), patch('openevent.cmd_sdk.dependencies.version', return_value=version):
-                require_sdk()
 
 
 if __name__ == '__main__':

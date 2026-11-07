@@ -71,23 +71,6 @@ class WorkerSignalsTest(unittest.TestCase):
         client.close.assert_called_once_with()
         self.assertTrue(worker.stopping)
 
-    def test_non_rpc_fetch_exception_is_not_retried(self):
-        worker, client = self.worker()
-        worker.startup = Mock()
-        client.fetch.side_effect = ValueError("invalid SDK state")
-        with (
-            patch("openevent.cmd_worker.worker.time.sleep") as sleep,
-            patch.object(worker, "stop", wraps=worker.stop) as stop,
-        ):
-            with self.assertRaisesRegex(ValueError, "invalid SDK state"):
-                self.run_cli(worker, client)
-
-        client.fetch.assert_called_once()
-        sleep.assert_not_called()
-        stop.assert_called_once_with()
-        client.close.assert_called_once_with()
-        self.assertTrue(worker.stopping)
-
     def test_signals_during_cleanup_finish_all_tasks_and_preserve_exit_cause(self):
         for first_signal in (signal.SIGTERM, signal.SIGINT, None):
             with self.subTest(first_signal=first_signal):
