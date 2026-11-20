@@ -7,7 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING
@@ -18,8 +18,8 @@ if TYPE_CHECKING:
 import grpc
 
 from openevent.cmd_sdk import parse_message
+from openevent.cmd_sdk.codec import json_bytes, output_read_result_input_to_dict
 from openevent.cmd_sdk.errors import CmdSDKError
-from openevent.cmd_sdk.dependencies import require_sdk
 from openevent.cmd_sdk.model import (
     CmdKillRequest,
     CmdKillResult,
@@ -33,7 +33,7 @@ from openevent.cmd_sdk.model import (
     CmdRunResultInput,
 )
 
-from .channel_resolver import ChannelResolver
+from .channel_resolver import validate_channels
 from .config import CmdWorkerConfig
 from .publisher import ReliablePublisher
 from .runner import CommandRunner, CommandStartError, RunningCommand, empty_output, now_ms
@@ -44,14 +44,15 @@ class RunEvent:
     seq: int
     channel_id: int
     principal: int
-    server_ts_ms: int
+    timeout_ms: int
+    deadline_ms: int
     request: CmdRunRequest
     object_keys: tuple[openevent_pb2.ObjectKey, ...] = ()
 
 
 @dataclass(frozen=True)
 class ActiveRun:
-    request: RunEvent
+    principal: int
     command: RunningCommand
 
 
@@ -91,7 +92,6 @@ class CmdWorker:
     def __init__(self, config: CmdWorkerConfig, openevent_client):
         self.config = config
         self.openevent_client = openevent_client
-        self.resolver = ChannelResolver(openevent_client, config.principal, config.token, config.channel_ids)
         self.runner = CommandRunner(config.output_dir)
         self.publisher = ReliablePublisher(
             openevent_client,
@@ -101,6 +101,7 @@ class CmdWorker:
         )
         self.next_fetch_seq = 1
         self.pending: OrderedDict[tuple[int, int], RunEvent] = OrderedDict()
+        self._next_pending_deadline_ms: int | None = None
         self.running: dict[tuple[int, int], ActiveRun] = {}
         self.completions: Queue[CompletionEvent] = Queue()
         self.stopping = False
@@ -115,7 +116,14 @@ class CmdWorker:
                 completed = page_completed or completed
                 scheduled = self._drain_pending()
                 if not self.stopping and not observed and not completed and not scheduled:
-                    time.sleep(self.config.fetch_idle_sleep_ms / 1000)
+                    delay_ms = self.config.fetch_idle_sleep_ms
+                    if self._next_pending_deadline_ms is not None:
+                        delay_ms = min(delay_ms, max(0, self._next_pending_deadline_ms - now_ms()))
+                    try:
+                        event = self.completions.get(timeout=delay_ms / 1000)
+                    except Empty:
+                        continue
+                    self._handle_completion(event)
         finally:
             self.stop()
 
@@ -124,8 +132,7 @@ class CmdWorker:
         self._kill_all_running()
 
     def startup(self) -> None:
-        require_sdk()
-        self.resolver.validate_startup()
+        validate_channels(self.openevent_client, self.config)
         self.runner.prepare_output_root()
         recovery = self._scan_history()
         for event in recovery.requests.values():
@@ -150,11 +157,12 @@ class CmdWorker:
 
     def _fetch_round(self) -> tuple[bool, bool]:
         """Consume pages through one fixed boundary before scheduling new runs."""
-        completed = False
+        completed = self._expire_pending()
 
         def after_page() -> None:
             nonlocal completed
             completed = self._drain_completions() or completed
+            completed = self._expire_pending() or completed
 
         observed = self._consume_pages(self._observe_realtime_message, after_page=after_page)
         return observed, completed
@@ -215,8 +223,6 @@ class CmdWorker:
         if int(message.principal) == 0:
             return None
         channel_id = int(message.channel_id)
-        if not self.resolver.owns(channel_id):
-            return None
         try:
             parsed = parse_message(message)
         except CmdSDKError as exc:
@@ -237,7 +243,16 @@ class CmdWorker:
                     recovery.accepted.discard((channel_id, payload.prev_seq))
             return None
         if isinstance(payload, CmdRunRequest):
-            return RunEvent(parsed.seq, parsed.channel_id, parsed.principal, int(message.ts_ms), payload, parsed.object_keys)
+            timeout_ms = payload.timeout_ms or self.config.default_timeout_ms
+            return RunEvent(
+                seq=parsed.seq,
+                channel_id=parsed.channel_id,
+                principal=parsed.principal,
+                timeout_ms=timeout_ms,
+                deadline_ms=int(message.ts_ms) + timeout_ms,
+                request=payload,
+                object_keys=parsed.object_keys,
+            )
         if isinstance(payload, CmdKillRequest):
             return KillEvent(parsed.seq, parsed.channel_id, parsed.principal, payload)
         if isinstance(payload, CmdOutputReadRequest):
@@ -254,9 +269,34 @@ class CmdWorker:
 
     def _handle_run_event(self, event: RunEvent) -> None:
         self.pending[(event.channel_id, event.seq)] = event
+        if self._next_pending_deadline_ms is None or event.deadline_ms < self._next_pending_deadline_ms:
+            self._next_pending_deadline_ms = event.deadline_ms
+
+    def _expire_pending(self) -> bool:
+        if not self.pending:
+            self._next_pending_deadline_ms = None
+            return False
+        current_ms = now_ms()
+        if self._next_pending_deadline_ms is not None and current_ms < self._next_pending_deadline_ms:
+            return False
+
+        # Removing the earliest job can leave an early wake-up. Recompute the
+        # minimum only when it is reached, without retaining IDs of removed jobs.
+        next_deadline = None
+        expired = []
+        for key, event in self.pending.items():
+            if event.deadline_ms <= current_ms:
+                expired.append(key)
+            elif next_deadline is None or event.deadline_ms < next_deadline:
+                next_deadline = event.deadline_ms
+        self._next_pending_deadline_ms = next_deadline
+        for key in expired:
+            event = self.pending.pop(key)
+            self._publish_run_result(event, "TIMEOUT")
+        return bool(expired)
 
     def _drain_pending(self) -> bool:
-        handled = False
+        handled = self._expire_pending()
         while not self.stopping and self.pending and len(self.running) < self.config.max_concurrent_tasks:
             _, event = self.pending.popitem(last=False)
             handled = True
@@ -264,14 +304,12 @@ class CmdWorker:
         return handled
 
     def _start_or_timeout(self, event: RunEvent) -> None:
-        timeout_ms = event.request.timeout_ms or self.config.default_timeout_ms
-        deadline_ms = event.server_ts_ms + timeout_ms
-        if now_ms() >= deadline_ms:
-            self._publish_run_result(event, "TIMEOUT", timeout_ms=timeout_ms)
+        if now_ms() >= event.deadline_ms:
+            self._publish_run_result(event, "TIMEOUT")
             return
         self.publisher.publish_run_accepted(event.channel_id, event.principal, event.seq)
-        if now_ms() >= deadline_ms:
-            self._publish_run_result(event, "TIMEOUT", timeout_ms=timeout_ms)
+        if now_ms() >= event.deadline_ms:
+            self._publish_run_result(event, "TIMEOUT")
             return
         start_error = None
         # CLI stop handlers defer raising while a new process is being created
@@ -283,18 +321,18 @@ class CmdWorker:
             try:
                 task = self.runner.start(
                     event.channel_id, event.seq, event.request.command, event.request.workdir,
-                    timeout_ms, deadline_ms, object_keys=event.object_keys,
+                    event.timeout_ms, event.deadline_ms, object_keys=event.object_keys,
                 )
             except CommandStartError as exc:
                 start_error = exc
             else:
-                self.running[(event.channel_id, event.seq)] = ActiveRun(event, task)
+                self.running[(event.channel_id, event.seq)] = ActiveRun(event.principal, task)
         finally:
             self.starting_command = False
         if self.stopping:
             return
         if start_error is not None:
-            self._publish_run_result(event, "START_FAILED", timeout_ms=timeout_ms, error_message=str(start_error))
+            self._publish_run_result(event, "START_FAILED", error_message=str(start_error))
             return
         thread = threading.Thread(target=self._wait_task, args=(task,), daemon=True)
         thread.start()
@@ -302,17 +340,16 @@ class CmdWorker:
     def _wait_task(self, task: RunningCommand) -> None:
         try:
             remaining = max(0, (task.deadline_ms - now_ms()) / 1000)
-            return_code = self.runner.wait(task, timeout=remaining)
-            self.completions.put(CompletionEvent(task.channel_id, task.seq, return_code))
-        except subprocess.TimeoutExpired:
             try:
+                return_code = self.runner.wait(task, timeout=remaining)
+            except subprocess.TimeoutExpired:
                 self.runner.terminate(task, "TIMEOUT")
                 return_code = self.runner.wait(task)
-                self.completions.put(CompletionEvent(task.channel_id, task.seq, return_code))
-            except Exception as exc:
-                self.completions.put(CompletionEvent(task.channel_id, task.seq, None, error=exc))
         except Exception as exc:
-            self.completions.put(CompletionEvent(task.channel_id, task.seq, None, error=exc))
+            event = CompletionEvent(task.channel_id, task.seq, None, error=exc)
+        else:
+            event = CompletionEvent(task.channel_id, task.seq, return_code)
+        self.completions.put(event)
 
     def _drain_completions(self) -> bool:
         handled = False
@@ -322,13 +359,16 @@ class CmdWorker:
             except Empty:
                 return handled
             handled = True
-            if event.error is not None:
-                raise RuntimeError(
-                    f"failed to wait for command channel_id={event.channel_id} seq={event.seq}"
-                ) from event.error
-            active = self.running.get((event.channel_id, event.seq))
-            if active is not None:
-                self._finish_task(active, event.return_code)
+            self._handle_completion(event)
+
+    def _handle_completion(self, event: CompletionEvent) -> None:
+        if event.error is not None:
+            raise RuntimeError(
+                f"failed to wait for command channel_id={event.channel_id} seq={event.seq}"
+            ) from event.error
+        active = self.running.get((event.channel_id, event.seq))
+        if active is not None:
+            self._finish_task(active, event.return_code)
 
     def _finish_task(self, active: ActiveRun, return_code: int) -> None:
         task = active.command
@@ -337,7 +377,7 @@ class CmdWorker:
             reason = task.kill_reason
         status = reason or ("SUCCESS" if return_code == 0 else "FAILED")
         self._publish_run_result(
-            active.request, status, timeout_ms=task.timeout_ms,
+            active, status,
             started_at_ms=task.started_at_ms,
             exit_code=return_code if reason is None else None,
         )
@@ -348,11 +388,6 @@ class CmdWorker:
         active = self.running.get(target_key)
         if active is not None:
             task = active.command
-            return_code = self.runner.poll(task)
-            if return_code is not None:
-                self._finish_task(active, return_code)
-                self._publish_kill_result(event, "NOT_RUNNING")
-                return
             if self.runner.terminate(task, "KILLED"):
                 self._publish_kill_result(event, "KILL_SENT")
             else:
@@ -361,9 +396,12 @@ class CmdWorker:
             return
         pending = self.pending.pop(target_key, None)
         if pending is not None:
-            self._publish_run_result(pending, "KILLED", timeout_ms=pending.request.timeout_ms or self.config.default_timeout_ms)
-            self._publish_kill_result(event, "REMOVED_PENDING")
-            return
+            if now_ms() >= pending.deadline_ms:
+                self._publish_run_result(pending, "TIMEOUT")
+            else:
+                self._publish_run_result(pending, "KILLED")
+                self._publish_kill_result(event, "REMOVED_PENDING")
+                return
         self._publish_kill_result(event, "NOT_RUNNING")
 
     def _handle_output_read_event(self, event: OutputReadEvent) -> None:
@@ -384,8 +422,8 @@ class CmdWorker:
 
         def failed(reason: str) -> CmdOutputReadResultInput:
             return CmdOutputReadResultInput(
-                status="READ_FAILED", bytes=0, eof=False, content_encoding="utf-8",
-                content="", error_message=_error_text(reason), **base,
+                status="READ_FAILED", eof=False, content_encoding="utf-8",
+                content="", error_message=reason, **base,
             )
 
         try:
@@ -399,57 +437,56 @@ class CmdWorker:
                 handle.seek(req.offset)
                 raw = handle.read(req.nbytes)
         except FileNotFoundError:
-            return CmdOutputReadResultInput(status="NOT_FOUND", bytes=0, eof=True, content_encoding="utf-8", content="", **base)
+            return CmdOutputReadResultInput(status="NOT_FOUND", eof=True, content_encoding="utf-8", content="", **base)
         except OSError as exc:
             return failed(str(exc))
         if len(raw) != req.nbytes:
             return failed("output file did not provide the complete requested range")
-        content_encoding, content = _encode_content(raw)
-        return CmdOutputReadResultInput(
-            status="SUCCESS", bytes=len(raw), eof=req.offset + req.nbytes == size,
-            content_encoding=content_encoding, content=content, **base,
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        result = CmdOutputReadResultInput(
+            status="SUCCESS", eof=req.offset + req.nbytes == size,
+            content_encoding="base64" if text is None else "utf-8", content="", **base,
         )
+        # An empty JSON string already includes the quotes. Only its contents
+        # need to fit in the space left by the other response fields.
+        overhead = len(json_bytes(output_read_result_input_to_dict(result)))
+        available = self.config.open_event.max_payload_bytes - overhead
+        content = _fit_output_content(raw, text, available)
+        if content is None:
+            return failed("encoded output read result exceeds max_payload_bytes")
+        return replace(result, content=content)
 
     def _publish_recovery_failed(self, event: RunEvent) -> None:
-        timeout_ms = event.request.timeout_ms or self.config.default_timeout_ms
         self._publish_run_result(
-            event, "RECOVERY_FAILED", timeout_ms=timeout_ms,
+            event, "RECOVERY_FAILED",
             error_message="worker recovered accepted run request without final result",
         )
 
     def _publish_run_result(
         self,
-        event: RunEvent,
+        run: RunEvent | ActiveRun,
         status: str,
-        timeout_ms: int,
         started_at_ms: int | None = None,
         exit_code: int | None = None,
         error_message: str | None = None,
     ) -> None:
-        result = self._run_result_input(event, status, timeout_ms=timeout_ms, started_at_ms=started_at_ms, exit_code=exit_code, error_message=error_message)
-        self.publisher.publish_run_result(event.channel_id, event.principal, result)
-
-    def _run_result_input(
-        self,
-        event: RunEvent,
-        status: str,
-        timeout_ms: int,
-        started_at_ms: int | None = None,
-        exit_code: int | None = None,
-        error_message: str | None = None,
-    ) -> CmdRunResultInput:
-        output_file = f"{event.channel_id}/{event.seq}"
+        task = run.command if isinstance(run, ActiveRun) else run
+        output_file = f"{task.channel_id}/{task.seq}"
         empty = started_at_ms is None and status != "RECOVERY_FAILED"
-        return CmdRunResultInput(
-            prev_seq=event.seq,
+        result = CmdRunResultInput(
+            prev_seq=task.seq,
             status=status,
-            timeout_ms=timeout_ms,
+            timeout_ms=task.timeout_ms,
             started_at_ms=started_at_ms,
             exit_code=exit_code,
-            stdout=empty_output(f"{output_file}.stdout") if empty else self.runner.output_for(event.channel_id, event.seq, "stdout"),
-            stderr=empty_output(f"{output_file}.stderr") if empty else self.runner.output_for(event.channel_id, event.seq, "stderr"),
-            error_message=_error_text(error_message) if error_message else None,
+            stdout=empty_output(f"{output_file}.stdout") if empty else self.runner.output_for(task.channel_id, task.seq, "stdout"),
+            stderr=empty_output(f"{output_file}.stderr") if empty else self.runner.output_for(task.channel_id, task.seq, "stderr"),
+            error_message=error_message,
         )
+        self.publisher.publish_run_result(task.channel_id, run.principal, result)
 
     def _publish_kill_result(self, event: KillEvent, status: str) -> None:
         result = CmdKillResultInput(prev_seq=event.seq, target_seq=event.request.target_seq, status=status)
@@ -457,18 +494,36 @@ class CmdWorker:
 
     def _kill_all_running(self) -> None:
         tasks = [active.command for active in self.running.values()]
+        first_error: BaseException | None = None
         for task in tasks:
-            self.runner.terminate(task, "KILLED")
+            try:
+                self.runner.terminate(task, "KILLED")
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
         for task in tasks:
-            self.runner.wait(task)
+            try:
+                self.runner.wait(task)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
-def _error_text(message: str) -> str:
-    return message.encode("utf-8")[:512].decode("utf-8", errors="ignore")
-
-
-def _encode_content(raw: bytes) -> tuple[str, str]:
-    try:
-        return "utf-8", raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return "base64", base64.b64encode(raw).decode("ascii")
+def _fit_output_content(raw: bytes, text: str | None, available: int) -> str | None:
+    if text is None:
+        if 4 * ((len(raw) + 2) // 3) > available:
+            return None
+        return base64.b64encode(raw).decode("ascii")
+    if len(raw) > available:
+        return None
+    # A control byte needs at most six JSON bytes. Only ambiguous sizes need
+    # to count actual escaping, using the same encoder as the final publish.
+    if 6 * len(raw) > available:
+        chunk_chars = min(16 * 1024, max(1, available // 6))
+        for start in range(0, len(text), chunk_chars):
+            available -= len(json_bytes(text[start:start + chunk_chars])) - 2
+            if available < 0:
+                return None
+    return text

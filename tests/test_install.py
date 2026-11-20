@@ -1,24 +1,24 @@
-"""Verify same-version installation and dependency handling with local wheels."""
+"""Observable results of building, installing and cleaning Cmd."""
 
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
-import tempfile
-import unittest
 import venv
 import zipfile
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def write_wheel(directory, name, version, files, requires=()):
+def write_wheel(directory, name, version, files, requires=(), extras=()):
     metadata = f"{name}-{version}.dist-info"
     contents = dict(files)
     contents[f"{metadata}/METADATA"] = (
         f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+        + "".join(f"Provides-Extra: {extra}\n" for extra in extras)
         + "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
     )
     contents[f"{metadata}/WHEEL"] = (
@@ -27,91 +27,105 @@ def write_wheel(directory, name, version, files, requires=()):
     )
     record = f"{metadata}/RECORD"
     contents[record] = "".join(f"{path},,\n" for path in [*contents, record])
-    with zipfile.ZipFile(directory / f"{name}-{version}-py3-none-any.whl", "w") as archive:
+    wheel = directory / f"{name}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
         for member, content in contents.items():
             archive.writestr(member, content)
+    return wheel
 
 
-class InstallTest(unittest.TestCase):
-    def setUp(self):
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(prefix="install-test-", dir=build)
-        self.addCleanup(temporary.cleanup)
-        self.workspace = Path(temporary.name)
-        (self.workspace / "scripts").mkdir()
-        self.wheels = self.workspace / "dist"
-        self.wheels.mkdir()
-        shutil.copyfile(ROOT / "scripts/install.py", self.workspace / "scripts/install.py")
-        self.environment = {key: value for key, value in os.environ.items()
-                            if not key.startswith("PIP_") and key != "PYTHONPATH"}
-        self.environment.update(PYTHONDONTWRITEBYTECODE="1", PIP_NO_COMPILE="1",
-                                PIP_NO_CACHE_DIR="1", PIP_CONFIG_FILE=os.devnull,
-                                PIP_DISABLE_PIP_VERSION_CHECK="1", TMPDIR=str(self.workspace))
+@pytest.fixture
+def python(tmp_path):
+    directory = tmp_path / "chosen environment"
+    venv.EnvBuilder(system_site_packages=True).create(directory)
+    return directory / "bin" / "python"
 
-    def install(self, python=sys.executable, *arguments):
-        return subprocess.run(
-            [str(python), "-B", str(self.workspace / "scripts/install.py"),
-             "--no-index", "--find-links", str(self.wheels), *arguments],
-            env=self.environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
 
-    def test_replaces_same_version_and_only_changes_unsatisfied_dependencies(self):
-        builder = venv.EnvBuilder(system_site_packages=True)
-        location = self.workspace / "environment"
-        builder.create(location)
-        python = builder.ensure_directories(location).env_exe
-        site = Path(subprocess.check_output(
-            [python, "-B", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-            env=self.environment, text=True,
-        ).strip())
+@pytest.fixture
+def pip_env(tmp_path):
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("PIP_")}
+    environment.update(PIP_NO_INDEX="1", PIP_NO_CACHE_DIR="1", PIP_CONFIG_FILE=os.devnull, TMPDIR=str(tmp_path),
+                       PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
+    return environment
 
-        def project(content, obsolete=False, requires=("cmd_install_dependency>=1",)):
-            files = {"cmd_install_project.py": content}
-            if obsolete:
-                files["cmd_install_obsolete.py"] = "old"
-            write_wheel(self.wheels, "openevent_modules_cmd", "0.1.0", files, requires)
 
-        write_wheel(self.wheels, "cmd_install_dependency", "1.0", {"cmd_install_dependency.py": "one"})
-        project("old", obsolete=True)
-        first = self.install(python)
-        self.assertEqual(first.returncode, 0, first.stdout)
-        dependency = site / "cmd_install_dependency.py"
-        installed = site / "cmd_install_project.py"
-        self.assertEqual(installed.read_text(), "old")
-        mtime = dependency.stat().st_mtime_ns
+def test_install_replaces_same_version_and_only_changes_unsatisfied_dependencies(tmp_path, python, pip_env):
+    wheels = tmp_path / "wheelhouse"
+    wheels.mkdir()
+    pip_env["PIP_FIND_LINKS"] = wheels.as_uri()
+    site = Path(subprocess.check_output(
+        [python, "-B", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        env=pip_env, text=True,
+    ).strip())
 
-        write_wheel(self.wheels, "cmd_install_dependency", "2.0", {"cmd_install_dependency.py": "two"})
-        project("new")
-        repeated = self.install(python)
-        self.assertEqual(repeated.returncode, 0, repeated.stdout)
-        self.assertEqual(installed.read_text(), "new")
-        self.assertFalse((site / "cmd_install_obsolete.py").exists())
-        self.assertEqual(dependency.read_text(), "one")
-        self.assertEqual(dependency.stat().st_mtime_ns, mtime)
+    def install(value, dependency="cmd_install_dependency>=1", *, obsolete=False, test_env=False):
+        files = {"openevent/cmd_sdk/__init__.py": f"value = {value!r}\n"}
+        if obsolete:
+            files["openevent/cmd_sdk/obsolete.py"] = ""
+        wheel = write_wheel(tmp_path, "openevent_modules_cmd", "0.4.0", files,
+                            requires=(dependency, 'cmd_test_dependency==1; extra == "test"'),
+                            extras=("test",))
+        options = ["--test-env"] if test_env else []
+        subprocess.run([python, "-B", ROOT / "scripts/install.py", *options, wheel],
+                       cwd=tmp_path, env=pip_env, check=True)
 
-        project("new dependency", requires=("cmd_install_dependency>=2",))
-        changed = self.install(python)
-        self.assertEqual(changed.returncode, 0, changed.stdout)
-        self.assertEqual(dependency.read_text(), "two")
-        self.assertEqual(installed.read_text(), "new dependency")
+    project = site / "openevent/cmd_sdk/__init__.py"
+    dependency = site / "cmd_install_dependency.py"
+    test_dependency = site / "cmd_test_dependency.py"
+    write_wheel(wheels, "cmd_install_dependency", "1.0", {dependency.name: "one"})
+    write_wheel(wheels, "cmd_test_dependency", "1.0", {test_dependency.name: ""})
+    install("old", obsolete=True)
+    assert project.read_text() == "value = 'old'\n"
+    assert dependency.read_text() == "one"
+    assert not test_dependency.exists()
+    mtime = dependency.stat().st_mtime_ns
 
-        project("must not install", requires=("cmd_install_missing_dependency==1",))
-        failed = self.install(python)
-        self.assertNotEqual(failed.returncode, 0, failed.stdout)
-        self.assertEqual(installed.read_text(), "new dependency")
+    write_wheel(wheels, "cmd_install_dependency", "2.0", {dependency.name: "two"})
+    install("new", test_env=True)
+    assert project.read_text() == "value = 'new'\n"
+    assert not (project.parent / "obsolete.py").exists()
+    assert test_dependency.is_file()
+    assert dependency.read_text() == "one"
+    assert dependency.stat().st_mtime_ns == mtime
 
-    def test_requires_one_current_project_wheel(self):
-        for versions in ((), ("0.1.0", "0.2.0")):
-            with self.subTest(versions=versions):
-                for version in versions:
-                    write_wheel(self.wheels, "openevent_modules_cmd", version, {})
-                result = self.install()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Exactly one Cmd wheel", result.stdout)
+    install("needs newer dependency", dependency="cmd_install_dependency>=2")
+    assert dependency.read_text() == "two"
 
-    def test_alternate_destination_rejected(self):
-        result = self.install(sys.executable, "--target", str(self.workspace / "target"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("choose its interpreter with PYTHON", result.stdout)
-        self.assertFalse((self.workspace / "target").exists())
+
+@pytest.mark.parametrize("option", ["prefix", "user"])
+def test_install_rejects_redirected_pip_conf_before_build(tmp_path, python, pip_env, option):
+    for name in ("Makefile", "build.sh", "pyproject.toml"):
+        shutil.copy2(ROOT / name, tmp_path / name)
+    shutil.copytree(ROOT / "scripts", tmp_path / "scripts")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    previous = dist / "openevent_modules_cmd-0.3.0-py3-none-any.whl"
+    previous.touch()
+    outside = tmp_path / "redirected"
+    pip_env["PYTHONUSERBASE"] = str(outside)
+    value = outside if option == "prefix" else "true"
+    (python.parent.parent / "pip.conf").write_text(f"[install]\n{option} = {value}\n")
+    empty_config = tmp_path / "empty.conf"
+    empty_config.touch()
+    pip_env["PIP_CONFIG_FILE"] = str(empty_config)
+    result = subprocess.run(["make", "install", f"PYTHON={python}"], cwd=tmp_path, env=pip_env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert result.returncode != 0
+    assert f"--{option}" in result.stdout or f"install.{option}" in result.stdout, result.stdout
+    assert previous.exists()
+    assert not outside.exists()
+
+
+def test_clean_preserves_other_artifacts_and_local_environment(tmp_path):
+    shutil.copy2(ROOT / "Makefile", tmp_path / "Makefile")
+    keep = ("dist/other-1-py3-none-any.whl", "build/wheelhouse/dependency.whl", "build/venv/pyvenv.cfg")
+    generated = ("dist/openevent_modules_cmd-0.4.0-py3-none-any.whl", "build/tmp/work", "build/unit/results")
+    for name in (*keep, *generated):
+        path = tmp_path / name
+        path.parent.mkdir(exist_ok=True, parents=True)
+        path.touch()
+    subprocess.run(["make", "clean"], cwd=tmp_path, check=True)
+    for name in keep:
+        assert (tmp_path / name).exists()
+    for name in generated:
+        assert not (tmp_path / name).exists()

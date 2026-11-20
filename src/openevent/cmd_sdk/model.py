@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 
 MAX_TIMEOUT_MS = 2**64 - 1
+INLINE_OUTPUT_BYTES = 1024
 
 KIND_RUN_REQUEST = "cmd.run.request"
 KIND_RUN_ACCEPTED = "cmd.run.accepted"
@@ -145,7 +146,6 @@ class CmdOutputReadResultInput:
     prev_seq: int
     status: str
     content: str
-    bytes: int
     eof: bool
     content_encoding: str
     target_seq: int
@@ -162,7 +162,6 @@ class CmdOutputReadResult:
     ts_ms: int
     status: str
     content: str
-    bytes: int
     eof: bool
     content_encoding: str
     target_seq: int

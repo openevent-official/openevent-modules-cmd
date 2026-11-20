@@ -2,34 +2,10 @@
 
 [中文版](CONFIGURATION_cn.md)
 
-Use `--config` to specify a YAML configuration file:
+Copy [cmd-worker.yaml](../examples/cmd-worker.yaml), edit it for your deployment, and pass it to `--config`.
 
 ```bash
 cmd-worker --config cmd-worker.yaml
-```
-
-Example file: [cmd-worker.yaml](../examples/cmd-worker.yaml).
-
-## Example
-
-```yaml
-open_event:
-  addr: 127.0.0.1:9527
-  max_payload_bytes: 16777216
-
-principal: 30001
-token: token-xxx
-
-channel_ids:
-  - 2001
-  - 2002
-
-output_dir: cmd-worker-output
-max_concurrent_tasks: 8
-default_timeout_ms: 300000
-fetch_idle_sleep_ms: 100
-fetch_error_max_retries: 3
-fetch_error_retry_sleep_ms: 1000
 ```
 
 ## Fields
@@ -44,7 +20,7 @@ fetch_error_retry_sleep_ms: 1000
 | `output_dir` | no | `cmd-worker-output` | Local root directory for stdout/stderr files. |
 | `max_concurrent_tasks` | no | `8` | Maximum number of concurrently running command tasks. Must be a positive integer. |
 | `default_timeout_ms` | no | `300000` | Timeout when the request omits `timeout_ms`. Integer range: `1..18446744073709551615` (`2**64-1`). |
-| `fetch_idle_sleep_ms` | no | `100` | Milliseconds to wait when the scheduling loop is idle. Must be a positive integer. |
+| `fetch_idle_sleep_ms` | no | `100` | Maximum idle wait for the scheduling loop, in milliseconds. Must be a positive integer. |
 | `fetch_error_max_retries` | no | `3` | Maximum retry count after each `Fetch` call first raises an RPC error. Must be a positive integer. |
 | `fetch_error_retry_sleep_ms` | no | `1000` | Milliseconds to wait before each retry after a `Fetch` RPC error. Must be a positive integer. |
 
@@ -67,14 +43,16 @@ Cmd requests, log payload errors, or publish Cmd results for them.
 
 - `output_dir` may be relative or absolute. Relative paths are resolved against
   the current working directory used to start `cmd-worker`.
-- Startup creates and checks `output_dir`; failure to create or write to it causes
-  a configuration/environment error and exit.
+- Startup creates `output_dir` when needed; failure to create it causes a
+  configuration/environment error and exit. Startup does not probe write access;
+  an actual write failure is reported when a command starts.
 - Output is written under `output_dir/<channel_id>/`, without automatic cleanup or
   file size limits. Cleanup and capacity protection are deployment responsibilities.
-- When concurrency is full, the worker continues consuming messages into an
-  in-memory queue. The pending queue and unresolved requests during recovery scanning
-  have no total size limit. The worker does not keep completed task identifiers or
-  request records in memory.
+- When all slots are full, the worker continues consuming messages and settling expired
+  requests in the queue. Task completion can wake the idle scheduling loop. Idle waits
+  end by the nearest pending deadline. Processing a message or RPC can delay publication.
+  The pending queue and unresolved requests during recovery scanning have no total size
+  limit. The worker does not keep completed task identifiers or request records in memory.
 
 ## Task Process Lifecycle
 
@@ -106,7 +84,7 @@ Historical requests are handled in seq order:
 
 - Requests with a corresponding result are skipped.
 - A run with accepted but no result receives `RECOVERY_FAILED`; its command is not rerun.
-- A run with neither accepted nor result is queued normally and checked for expiry before startup.
+- A run with neither accepted nor result enters the normal queue and follows the same pending timeout rules.
 - A kill or output read without its corresponding result is processed again using
   the task state and retained output files available during recovery. Output reads
   do not reconstruct a file snapshot from before the crash.
@@ -125,6 +103,8 @@ tasks and reap their shells as defined in [Task Process Lifecycle](#task-process
 Requests without final results are handled by recovery at the next startup.
 SIGINT/SIGTERM received during cleanup do not interrupt cleanup of the remaining tasks.
 When a stop signal triggers exit, the CLI preserves the exit code corresponding to the first stop signal.
+A failure to terminate or reap one task does not skip the others. After cleanup has
+been attempted for every task, the first error is reported.
 
 After a message decoding or validation failure, restart still scans history from
 the beginning. Encountering the same invalid message causes another error and

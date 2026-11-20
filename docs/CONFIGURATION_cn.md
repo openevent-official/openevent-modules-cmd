@@ -2,34 +2,10 @@
 
 [English version](CONFIGURATION.md)
 
-通过 `--config` 指定 YAML 配置文件：
+复制 [cmd-worker.yaml](../examples/cmd-worker.yaml)，按部署环境修改后，用 `--config` 指定该文件。
 
 ```bash
 cmd-worker --config cmd-worker.yaml
-```
-
-示例文件：[cmd-worker.yaml](../examples/cmd-worker.yaml)。
-
-## 示例
-
-```yaml
-open_event:
-  addr: 127.0.0.1:9527
-  max_payload_bytes: 16777216
-
-principal: 30001
-token: token-xxx
-
-channel_ids:
-  - 2001
-  - 2002
-
-output_dir: cmd-worker-output
-max_concurrent_tasks: 8
-default_timeout_ms: 300000
-fetch_idle_sleep_ms: 100
-fetch_error_max_retries: 3
-fetch_error_retry_sleep_ms: 1000
 ```
 
 ## 字段
@@ -44,7 +20,7 @@ fetch_error_retry_sleep_ms: 1000
 | `output_dir` | 否 | `cmd-worker-output` | stdout/stderr 文件的本地根目录 |
 | `max_concurrent_tasks` | 否 | `8` | 同时运行的命令任务上限，必须是正整数 |
 | `default_timeout_ms` | 否 | `300000` | 请求未指定 `timeout_ms` 时的超时值，整数范围 `1..18446744073709551615`（`2**64-1`） |
-| `fetch_idle_sleep_ms` | 否 | `100` | 调度循环空闲时的等待毫秒数，必须是正整数 |
+| `fetch_idle_sleep_ms` | 否 | `100` | 调度循环空闲时最多等待的毫秒数，必须是正整数 |
 | `fetch_error_max_retries` | 否 | `3` | 每次 `Fetch` 首次 RPC 异常后的最大重试次数，必须是正整数 |
 | `fetch_error_retry_sleep_ms` | 否 | `1000` | `Fetch` RPC 异常后每次重试前的等待毫秒数，必须是正整数 |
 
@@ -62,10 +38,12 @@ worker 在正常消费和启动恢复时，都在解析 Cmd payload 前直接跳
 ## 运行注意事项
 
 - `output_dir` 可以是相对路径或绝对路径；相对路径按启动 `cmd-worker` 时的当前工作目录解析。
-- 启动时创建并检查 `output_dir`；无法创建或写入时，报配置/环境错误并退出。
+- 启动时按需创建 `output_dir`；无法创建时，报配置/环境错误并退出。启动阶段不额外探测写权限，
+  实际写入错误在命令启动时报告。
 - 输出写入 `output_dir/<channel_id>/`，不自动清理，也不限制文件大小；清理和容量保护由部署方负责。
-- 并发已满时继续消费消息并在内存排队。待执行队列和恢复扫描中尚未闭合的请求没有总量上限；
-  worker 不在内存中保留已完成任务的标识及请求记录。
+- 并发已满时，worker 继续消费消息，并结算已过期的排队任务。任务完成可以唤醒空闲的调度循环。
+  空闲等待最多到最近的排队截止时间。正在处理的消息或 RPC 可能推迟结果发布。
+  待执行队列和恢复扫描中尚未闭合的请求没有总量上限。worker 不在内存中保留已完成任务的标识及请求记录。
 
 ## 任务进程生命周期
 
@@ -90,7 +68,7 @@ worker 启动时从头读取历史，以第一次 Fetch 返回的消息尾部固
 
 - 已有对应 result 的请求不再处理。
 - run 已有 accepted 但没有 result 时，补 `RECOVERY_FAILED`，不重新执行命令。
-- run 尚未 accepted 且没有 result 时，按正常请求入队，并在启动前检查是否已经超时。
+- run 尚未 accepted 且没有 result 时，按正常请求入队，沿用排队超时规则。
 - kill 或 output read 没有对应 result 时，重新处理这条请求，使用恢复时的任务状态和当时实际保留的输出文件。
   输出读取不会重建崩溃前的文件快照。
 
@@ -103,6 +81,7 @@ Fetch RPC 异常按上表重试；重试耗尽则 worker 退出。accepted/resul
 这些退出路径以及 Ctrl+C、SIGTERM 都会按[任务进程生命周期](#任务进程生命周期)清理当前 worker
 尚未收尾的任务并回收 shell；尚未写回结果的请求由下次启动恢复处理。
 清理期间收到 SIGINT/SIGTERM 不会打断剩余任务的清理。由停止信号触发退出时，CLI 保留首次停止信号对应的退出码。
+单个任务终止或回收失败不会跳过其他任务；全部任务都尝试清理后，再报告最先发生的错误。
 
 消息解析或校验失败后，重启仍从头扫描；遇到同一条非法消息仍会报错退出，不会自动跳过。
 

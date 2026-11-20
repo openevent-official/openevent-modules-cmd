@@ -1,10 +1,10 @@
-# Cmd Protocol cmd.v3
+# Cmd Protocol cmd.v4
 
 [中文版](CMD_PROTOCOL_cn.md)
 
 ## 1. Channel
 
-Cmd channels must set `protocol="cmd.v3"` and must not use public visibility.
+Cmd channels must set `protocol="cmd.v4"` and must not use public visibility.
 Both caller and worker principals must be channel members. Only one active
 worker may consume a channel at a time.
 
@@ -32,8 +32,8 @@ and `recipients` is the corresponding request sender's principal. Payload
 
 Output `content_encoding` is `utf-8` or `base64`: if the raw bytes decode as
 UTF-8, `content` is the decoded string; otherwise it is the base64 string of those
-bytes. Both fields must appear together. Empty output uses `bytes=0`,
-`content_encoding="utf-8"`, and `content=""`.
+bytes. Both fields must appear together. Empty content uses
+`content_encoding="utf-8"` and `content=""`.
 
 If a non-system message's payload cannot be decoded as a UTF-8 JSON object, or its
 message type or fields fail validation, the worker reports an error and exits.
@@ -69,14 +69,15 @@ the return size. Other results that cannot fit cause the worker to fail and exit
   executes it through `/bin/sh -c <command>` by default. See
   [Task Process Lifecycle](CONFIGURATION.md#task-process-lifecycle) for the scope
   of process management. Separate `env` and `stdin` fields are not supported.
+  Commands read standard input from `/dev/null` by default, so a read immediately
+  returns EOF. Commands can supply input using shell redirection or a pipeline.
 - `workdir` is optional: a non-empty absolute path string. If absent, the worker
   uses its current working directory. A missing path, a non-directory, denied
   access, or a path that prevents shell startup produces `START_FAILED` with
   `error_message`; it is not an invalid payload.
 - `timeout_ms` is optional: an integer in `1..18446744073709551615` (`2**64-1`).
-  If absent, the current default at request handling time applies.
-  [Startup recovery](CONFIGURATION.md#recovery-and-exit) also uses current
-  configuration, including for `RECOVERY_FAILED`.
+  If omitted, the worker uses its `default_timeout_ms` when it handles the request.
+  See [Recovery and exit](CONFIGURATION.md#recovery-and-exit) for how the worker handles past requests at startup.
 - The deadline is this message's top-level `EventMessage.ts_ms` plus the effective
   `timeout_ms`, never the payload's `ts_ms`.
 
@@ -109,8 +110,9 @@ For example, two attachments produce this environment variable value:
 ## 4. `cmd.run.accepted`
 
 Before starting a valid, non-expired run request, the worker must confirm that
-accepted was written. It then writes a final `cmd.run.result`; startup recovery
-completes unresolved requests with a failed result.
+`cmd.run.accepted` was written. It then writes a final `cmd.run.result`.
+At startup, the worker writes `RECOVERY_FAILED` only for a run request with a recorded
+`cmd.run.accepted` and no `cmd.run.result`. See the [recovery rules](CONFIGURATION.md#recovery-and-exit).
 
 ```json
 {
@@ -123,8 +125,9 @@ completes unresolved requests with a failed result.
 - After accepted is confirmed, the worker checks the deadline again. If it
   expired during publication, no process starts and the result is `TIMEOUT`.
   Accepted therefore does not guarantee that the command has started.
-- Requests that expire before obtaining an execution slot and requests killed
-  while pending receive `TIMEOUT` and `KILLED` run results respectively, without accepted.
+- A pending request can receive a `TIMEOUT` result at its deadline even when all execution slots
+  are occupied. Section 7 defines how a kill is handled while the request is pending.
+  Neither case produces an accepted message.
 
 ## 5. `cmd.run.result`
 
@@ -143,11 +146,11 @@ completes unresolved requests with a failed result.
 ```
 
 - `timeout_ms` is required and is the effective timeout defined in section 3.
-  `RECOVERY_FAILED` uses the explicit request value or the current recovery default.
 - The common `ts_ms` field is this result's creation time, not the actual command
   exit time. `started_at_ms` is the actual process start time and appears only
   after the process starts.
 - `exit_code` is the shell exit code and appears only for `SUCCESS` or `FAILED`.
+  If signal `N` terminates the shell itself and the result is `FAILED`, `exit_code` is `-N`. For example, SIGTERM gives `-15`.
 - `START_FAILED` and `RECOVERY_FAILED` require `error_message`.
 - Expiry before startup, a kill while pending, or startup
   failure produces empty stdout/stderr objects. `RECOVERY_FAILED` uses existing
@@ -239,8 +242,9 @@ section 9.
 | `NOT_RUNNING` | No running or pending target can be terminated in this channel. Completed and nonexistent tasks are not distinguished. |
 
 If the kill triggers termination first, the run result is `KILLED`; if a timeout
-already triggered, it remains `TIMEOUT`. When removing a pending task, the worker
-confirms the `KILLED` run result before writing `REMOVED_PENDING`. A crash between
+already triggered, it remains `TIMEOUT`. If a pending task has reached its deadline when
+the worker handles the kill, it confirms the `TIMEOUT` run result before replying `NOT_RUNNING`.
+Otherwise it confirms the `KILLED` run result before replying `REMOVED_PENDING`. A crash between
 these results leaves the run request closed after restart; the unfinished kill
 request returns `NOT_RUNNING`.
 
@@ -292,7 +296,6 @@ Reads the exact requested byte range from the worker-local
   "stream": "stdout",
   "offset": 0,
   "nbytes": 6,
-  "bytes": 6,
   "eof": true,
   "content_encoding": "utf-8",
   "content": "hello\n"
@@ -301,9 +304,8 @@ Reads the exact requested byte range from the worker-local
 
 - `target_seq`, `stream`, `offset`, and `nbytes` are required and must echo the
   request's values.
-- `status`, `content`, and `content_encoding` are required. On success, `bytes`
-  must equal the requested `nbytes`, and decoding `content` must produce all raw
-  bytes in the requested range.
+- `status`, `content`, and `content_encoding` are required. On success, decoding
+  `content` must produce all `nbytes` raw bytes in the requested range.
 - After opening the file, the worker obtains its initial size. On success, `eof`
   is `offset + nbytes == initial file size`. `eof=true` does not guarantee a running
   task will not append more output.
@@ -316,9 +318,10 @@ Reads the exact requested byte range from the worker-local
 | `NOT_FOUND` | Target output file does not exist. | `true` | — |
 | `READ_FAILED` | File exists but cannot be statted, opened, or read, or the exact range or message size requirements in section 8 cannot be met. | `false` | Required |
 
-The last two statuses use `content=""`, `bytes=0`, and `content_encoding="utf-8"`.
+The last two statuses use `content=""` and `content_encoding="utf-8"`.
 
 ## 10. Versioning Policy
 
-This package implements `cmd.v3`. It requires channels and callers using this protocol.
-Breaking changes must use a new protocol, such as `cmd.v4`.
+This package implements `cmd.v4`. It requires channels and callers using this protocol.
+When upgrading, create a `cmd.v4` channel, point callers to it, and update the worker's `channel_ids` configuration.
+Breaking changes require a new protocol version.

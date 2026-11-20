@@ -2,7 +2,7 @@
 
 [中文版](README_cn.md)
 
-The OpenEvent Cmd module provides a `cmd.v3` SDK and a Linux command worker.
+The OpenEvent Cmd module provides a `cmd.v4` SDK and a Linux command worker.
 Messages run or terminate commands, store stdout/stderr in local files, publish
 results, and read byte ranges from output files.
 
@@ -16,38 +16,34 @@ results, and read byte ranges from output files.
 Commands execute directly through the Linux shell on the worker host, without
 isolation, resource limits, or auditing.
 
-## Install And Test
+## Build And Install
+
+Run Make from the project root. Activate a writable virtual environment with pip installed. Make uses its `python3` by default. You can also set `PYTHON` to the virtual environment's interpreter. This example creates a virtual environment and installs Cmd.
 
 ```bash
+python3 -B -m venv build/venv
+source build/venv/bin/activate
 make install
-make test
-make check-docs
 ```
 
-Select the installation and test environment with `PYTHON=/path/to/venv/bin/python`.
-`make install` builds and replaces this package, even at the same version, and
-installs only missing or incompatible dependencies. Use `make build` to build without installing.
-User installations are supported with `INSTALL_ARGS=--user` for `make install` and `make e2e`.
+| Command | Purpose |
+| --- | --- |
+| `make build` | Default target. Build the current source in an isolated environment using `pyproject.toml`, then move the resulting wheel into `dist/`. |
+| `make install` | Install the wheel from this build into the selected environment. Replace Cmd even at the same version and reuse dependencies that meet its requirements. |
+| `make test` | Install the wheel from this build with its test dependencies and run the unit tests with the same Python. Pass pytest options with `TEST_ARGS`, for example `TEST_ARGS=-q`. |
+| `make clean` | Remove Cmd wheels, caches and temporary test files. Preserve virtual environments, offline dependencies and other projects' artifacts. |
 
-Build tools are retained in `build/tools-env/` and reused; changing `PYTHON` or its interpreter version rebuilds that environment.
-Each build checks the build dependencies declared in `pyproject.toml`, installing only missing or incompatible requirements
-without upgrading tools that already satisfy them. Builds use this environment without creating another temporary isolated
-environment; each build still removes old release artifacts and creates a new wheel from the current source.
-`make clean` also removes the tool environment.
+Run these commands sequentially in the same working directory. The selected virtual environment determines the install location. Before building, both `make install` and `make test` check pip's environment variables and configuration files. If a setting specifies an install prefix, enables user-site installation, or selects another install location, the command reports the conflicting option.
 
-`make test` runs unit and installation regression tests. End-to-end tests require
-an OpenEvent server from a successful current build:
+The installation tests create a temporary virtual environment and use the base interpreter's pip, so the base interpreter must also have pip installed. Temporary test files go under `build/unit/`.
+
+For offline use, populate `build/wheelhouse/` with wheels for the target Python and platform covering all build and runtime requirements (including the OpenEvent SDK) and their dependencies. Include test dependencies when running tests. The following command installs from that directory.
 
 ```bash
-OPENEVENT_SERVER_BIN=/path/to/openevent_server make e2e
+PIP_NO_INDEX=1 PIP_FIND_LINKS=build/wheelhouse make install
 ```
 
-`make e2e` builds and installs the current Cmd package in the selected environment,
-then starts a real server and worker. Both test targets use that environment's
-installed SDK and accept unittest arguments through `TEST_ARGS`. End-to-end case
-data and logs are in `build/e2e/cases/`.
-Final artifacts go into `dist/`; temporary files, caches, and test data go into
-`build/`.
+Replace `install` with `test` to run the tests offline.
 
 ## Run The Worker
 

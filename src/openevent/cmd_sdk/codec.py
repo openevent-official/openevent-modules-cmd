@@ -9,6 +9,7 @@ from typing import Any
 
 from .errors import CmdSDKError
 from .model import (
+    INLINE_OUTPUT_BYTES,
     KIND_KILL_REQUEST,
     KIND_KILL_RESULT,
     KIND_OUTPUT_READ_REQUEST,
@@ -30,6 +31,7 @@ from .model import (
     CmdOutputReadRequestInput,
     CmdOutputReadResult,
     CmdOutputReadResultInput,
+    CmdPayload,
     CmdRunAccepted,
     CmdRunRequest,
     CmdRunRequestInput,
@@ -37,25 +39,34 @@ from .model import (
     CmdRunResultInput,
 )
 
-COMMON_KINDS = frozenset(
-    {
-        KIND_RUN_REQUEST,
-        KIND_RUN_ACCEPTED,
-        KIND_RUN_RESULT,
-        KIND_KILL_REQUEST,
-        KIND_KILL_RESULT,
-        KIND_OUTPUT_READ_REQUEST,
-        KIND_OUTPUT_READ_RESULT,
-    }
-)
+MAX_ERROR_MESSAGE_BYTES = 512
+_PAYLOAD_MODELS: dict[str, type[CmdPayload]] = {
+    KIND_RUN_REQUEST: CmdRunRequest,
+    KIND_RUN_ACCEPTED: CmdRunAccepted,
+    KIND_RUN_RESULT: CmdRunResult,
+    KIND_KILL_REQUEST: CmdKillRequest,
+    KIND_KILL_RESULT: CmdKillResult,
+    KIND_OUTPUT_READ_REQUEST: CmdOutputReadRequest,
+    KIND_OUTPUT_READ_RESULT: CmdOutputReadResult,
+}
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def dumps_payload(data: dict[str, Any]) -> bytes:
     validate_payload_dict(data)
     try:
-        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if data.get("status") in ("START_FAILED", "RECOVERY_FAILED", "READ_FAILED"):
+            # A UTF-8 character occupies at least one byte.
+            prefix = data["error_message"][:MAX_ERROR_MESSAGE_BYTES].encode("utf-8")
+            data = {**data, "error_message": prefix[:MAX_ERROR_MESSAGE_BYTES].decode("utf-8", errors="ignore")}
+        return json_bytes(data)
     except (TypeError, ValueError) as exc:
         raise CmdSDKError("INVALID_JSON", "payload cannot be encoded as JSON") from exc
 
@@ -135,7 +146,6 @@ def output_read_result_input_to_dict(result: CmdOutputReadResultInput) -> dict[s
         "prev_seq": result.prev_seq,
         "ts_ms": result.ts_ms if result.ts_ms is not None else now_ms(),
         "status": result.status,
-        "bytes": result.bytes,
         "eof": result.eof,
         "content_encoding": result.content_encoding,
         "content": result.content,
@@ -157,69 +167,23 @@ def output_to_dict(output: CmdOutput) -> dict[str, Any]:
     return data
 
 
-def dict_to_model(data: dict[str, Any]):
+def dict_to_model(data: dict[str, Any]) -> CmdPayload:
     """Construct a model from a dictionary validated by loads_payload."""
-    kind = data["kind"]
-    if kind == KIND_RUN_REQUEST:
-        return CmdRunRequest(
-            command=data["command"],
-            workdir=data.get("workdir"),
-            timeout_ms=data.get("timeout_ms"),
-            ts_ms=data["ts_ms"],
-        )
-    if kind == KIND_RUN_ACCEPTED:
-        return CmdRunAccepted(prev_seq=data["prev_seq"], ts_ms=data["ts_ms"])
-    if kind == KIND_RUN_RESULT:
-        return CmdRunResult(
-            prev_seq=data["prev_seq"],
-            ts_ms=data["ts_ms"],
-            status=data["status"],
-            timeout_ms=data["timeout_ms"],
-            started_at_ms=data.get("started_at_ms"),
-            exit_code=data.get("exit_code"),
-            stdout=dict_to_output(data["stdout"]),
-            stderr=dict_to_output(data["stderr"]),
-            error_message=data.get("error_message"),
-        )
-    if kind == KIND_KILL_REQUEST:
-        return CmdKillRequest(target_seq=data["target_seq"], ts_ms=data["ts_ms"])
-    if kind == KIND_KILL_RESULT:
-        return CmdKillResult(prev_seq=data["prev_seq"], target_seq=data["target_seq"], ts_ms=data["ts_ms"], status=data["status"])
-    if kind == KIND_OUTPUT_READ_REQUEST:
-        return CmdOutputReadRequest(
-            target_seq=data["target_seq"],
-            stream=data["stream"],
-            offset=data["offset"],
-            nbytes=data["nbytes"],
-            ts_ms=data["ts_ms"],
-        )
-    if kind == KIND_OUTPUT_READ_RESULT:
-        return CmdOutputReadResult(
-            prev_seq=data["prev_seq"],
-            ts_ms=data["ts_ms"],
-            status=data["status"],
-            target_seq=data["target_seq"],
-            stream=data["stream"],
-            offset=data["offset"],
-            nbytes=data["nbytes"],
-            bytes=data["bytes"],
-            eof=data["eof"],
-            content_encoding=data["content_encoding"],
-            content=data["content"],
-            error_message=data.get("error_message"),
-        )
-    raise CmdSDKError("INVALID_KIND", "unknown cmd kind")
-
-
-def dict_to_output(data: dict[str, Any]) -> CmdOutput:
-    return CmdOutput(file=data["file"], bytes=data["bytes"], content_encoding=data.get("content_encoding"), content=data.get("content"))
+    model = _PAYLOAD_MODELS[data["kind"]]
+    if model is CmdRunResult:
+        data = {
+            **data,
+            "stdout": CmdOutput(**data["stdout"]),
+            "stderr": CmdOutput(**data["stderr"]),
+        }
+    return model(**data)
 
 
 def validate_payload_dict(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise CmdSDKError("INVALID_PAYLOAD", "payload must be a JSON object")
     kind = data.get("kind")
-    if kind not in COMMON_KINDS:
+    if not isinstance(kind, str) or kind not in _PAYLOAD_MODELS:
         raise CmdSDKError("INVALID_KIND", "kind is missing or invalid")
     _require_ts(data)
     if kind == KIND_RUN_REQUEST:
@@ -297,7 +261,6 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
                 "stream",
                 "offset",
                 "nbytes",
-                "bytes",
                 "eof",
                 "content_encoding",
                 "content",
@@ -310,15 +273,13 @@ def validate_payload_dict(data: Any) -> dict[str, Any]:
         _require_enum(data, "stream", OUTPUT_STREAMS)
         _require_non_negative_int(data, "offset")
         _require_positive_int(data, "nbytes")
-        _require_non_negative_int(data, "bytes")
         if not isinstance(data.get("eof"), bool):
             raise CmdSDKError("INVALID_EOF", "eof must be a boolean")
         _require_enum(data, "content_encoding", {"utf-8", "base64"})
         if not isinstance(data.get("content"), str):
             raise CmdSDKError("INVALID_CONTENT", "content must be a string")
-        _validate_content_size(data["content_encoding"], data["content"], data["bytes"], "content")
-        if status == "SUCCESS" and data["bytes"] != data["nbytes"]:
-            raise CmdSDKError("INVALID_OUTPUT_READ_RESULT", "SUCCESS must return exactly nbytes bytes")
+        if status == "SUCCESS":
+            _validate_content_size(data["content_encoding"], data["content"], data["nbytes"], "content")
         if status == "NOT_FOUND":
             _require_empty_output_read_result(data, eof=True, status=status)
         if status == "READ_FAILED":
@@ -336,10 +297,10 @@ def validate_output(data: Any, field: str) -> None:
         raise CmdSDKError("INVALID_OUTPUT_FILE", f"{field}.file must be relative")
     byte_count = _require_non_negative_int(data, "bytes")
     has_content = "content" in data
-    if byte_count <= 1024 and not has_content:
-        raise CmdSDKError("MISSING_OUTPUT_CONTENT", f"{field}.content is required when bytes <= 1024")
-    if byte_count > 1024 and has_content:
-        raise CmdSDKError("INVALID_OUTPUT_CONTENT", f"{field}.content must be absent when bytes > 1024")
+    if byte_count <= INLINE_OUTPUT_BYTES and not has_content:
+        raise CmdSDKError("MISSING_OUTPUT_CONTENT", f"{field}.content is required when bytes <= {INLINE_OUTPUT_BYTES}")
+    if byte_count > INLINE_OUTPUT_BYTES and has_content:
+        raise CmdSDKError("INVALID_OUTPUT_CONTENT", f"{field}.content must be absent when bytes > {INLINE_OUTPUT_BYTES}")
     if has_content:
         _require_enum(data, "content_encoding", {"utf-8", "base64"})
         if not isinstance(data["content"], str):
@@ -350,7 +311,7 @@ def validate_output(data: Any, field: str) -> None:
 
 
 def _require_empty_output_read_result(data: dict[str, Any], eof: bool, status: str) -> None:
-    if data["bytes"] != 0 or data["content"] != "" or data["content_encoding"] != "utf-8" or data["eof"] is not eof:
+    if data["content"] != "" or data["content_encoding"] != "utf-8" or data["eof"] is not eof:
         raise CmdSDKError("INVALID_OUTPUT_READ_RESULT", f"{status} must return an empty utf-8 content body")
 
 
@@ -363,7 +324,7 @@ def _validate_content_size(encoding: str, content: str, expected_bytes: int, fie
         except (UnicodeEncodeError, binascii.Error) as exc:
             raise CmdSDKError("INVALID_CONTENT", f"{field} must be valid base64") from exc
     if actual_bytes != expected_bytes:
-        raise CmdSDKError("INVALID_CONTENT_SIZE", f"{field} byte length must match bytes")
+        raise CmdSDKError("INVALID_CONTENT_SIZE", f"{field} has {actual_bytes} bytes, expected {expected_bytes}")
 
 
 def _require_ts(data: dict[str, Any]) -> None:

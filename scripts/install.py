@@ -1,39 +1,32 @@
-"""Install the unique project wheel produced by the successful build prerequisite."""
+"""Install the Cmd wheel supplied by the build in the selected Python environment."""
 
-import os
 from pathlib import Path
 import subprocess
 import sys
 
+from pip._internal.commands import create_command
 
-ROOT = Path(__file__).resolve().parents[1]
+
+def check_environment():
+    parser = create_command("install").parser
+    options, _ = parser.parse_args([])
+    for flag in ("--python", "--target", "--prefix", "--root", "--user"):
+        option = parser.get_option(flag)
+        if option and getattr(options, option.dest):
+            sys.exit(f"pip has {flag} set in the environment or pip configuration. "
+                     "Remove it to install into the selected virtual environment.")
 
 
 def main():
-    arguments = sys.argv[1:]
-    destinations = ("--target", "--prefix", "--root")
-    if (any(argument.startswith("-t") or any(
-            argument == option or argument.startswith(option + "=")
-            for option in destinations) for argument in arguments)
-            or any(os.environ.get(name) for name in ("PIP_TARGET", "PIP_PREFIX", "PIP_ROOT"))):
-        sys.exit("make install installs into the selected Python environment; "
-                 "choose its interpreter with PYTHON instead of --target, --prefix, or --root")
+    if sys.argv[1] == "--check-environment":
+        check_environment()
+        return
 
-    wheels = list((ROOT / "dist").glob("openevent_modules_cmd-*.whl"))
-    if len(wheels) != 1:
-        sys.exit("Exactly one Cmd wheel from a successful make build is required")
-
-    temporary = ROOT / "build" / "install-tmp"
-    temporary.mkdir(parents=True, exist_ok=True)
-    environment = dict(
-        os.environ, PYTHONDONTWRITEBYTECODE="1", PIP_NO_COMPILE="1",
-        PIP_NO_CACHE_DIR="1", PIP_DISABLE_PIP_VERSION_CHECK="1", TMPDIR=str(temporary),
-    )
+    wheel = str(Path(sys.argv[-1]).resolve())
+    requirement = f"{wheel}[test]" if sys.argv[1] == "--test-env" else wheel
     pip = [sys.executable, "-B", "-m", "pip", "install", "--no-compile"]
-    # Resolve the wheel's dependency metadata normally before replacing this project.
-    subprocess.run(pip + arguments + [str(wheels[0])], env=environment, check=True)
-    subprocess.run(pip + ["--force-reinstall", "--no-deps"] + arguments + [str(wheels[0])],
-                   env=environment, check=True)
+    subprocess.run(pip + [requirement], check=True)
+    subprocess.run(pip + ["--force-reinstall", "--no-deps", wheel], check=True)
 
 
 if __name__ == "__main__":

@@ -10,9 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openevent.cmd_sdk.model import CmdOutput
-
-INLINE_OUTPUT_BYTES = 1024
+from openevent.cmd_sdk.model import INLINE_OUTPUT_BYTES, CmdOutput
 
 
 class CommandStartError(RuntimeError):
@@ -38,9 +36,6 @@ class CommandRunner:
 
     def prepare_output_root(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        probe = self.output_dir / ".write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
 
     def start(self, channel_id: int, seq: int, command: str, workdir: str | None, timeout_ms: int, deadline_ms: int, *, object_keys=()) -> RunningCommand:
         channel_dir = self.output_dir / str(channel_id)
@@ -63,6 +58,7 @@ class CommandRunner:
                     shell=True,
                     cwd=workdir,
                     env=environment,
+                    stdin=subprocess.DEVNULL,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     start_new_session=True,
@@ -95,17 +91,18 @@ class CommandRunner:
 
     def wait(self, task: RunningCommand, timeout: float | None = None) -> int:
         deadline = None if timeout is None else time.monotonic() + timeout
+        delay = 0.001
         while True:
             return_code = self.poll(task)
             if return_code is not None:
                 return return_code
-            delay = 0.05
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(task.process.args, timeout)
                 delay = min(delay, remaining)
             time.sleep(delay)
+            delay = min(delay * 2, 0.05)
 
     def terminate(self, task: RunningCommand, reason: str) -> bool:
         with task.termination_lock:
@@ -140,31 +137,28 @@ class CommandRunner:
         return task.return_code
 
     def output_for(self, channel_id: int, seq: int, stream: str) -> CmdOutput:
-        suffix = "stdout" if stream == "stdout" else "stderr"
-        path = self.output_dir / str(channel_id) / f"{seq}.{suffix}"
-        return output_object(path, channel_id, seq, stream)
+        rel_file = f"{channel_id}/{seq}.{stream}"
+        path = self.output_dir / rel_file
+        try:
+            with path.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > INLINE_OUTPUT_BYTES:
+                    return CmdOutput(file=rel_file, bytes=size)
+                data = handle.read(size)
+        except FileNotFoundError:
+            return empty_output(rel_file)
+
+        try:
+            content = data.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            content = base64.b64encode(data).decode("ascii")
+            encoding = "base64"
+        return CmdOutput(file=rel_file, bytes=len(data), content_encoding=encoding, content=content)
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def output_object(path: Path, channel_id: int, seq: int, stream: str) -> CmdOutput:
-    rel_file = f"{channel_id}/{seq}.{stream}"
-    try:
-        with path.open("rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            if size > INLINE_OUTPUT_BYTES:
-                return CmdOutput(file=rel_file, bytes=size)
-            data = handle.read(min(size, INLINE_OUTPUT_BYTES))
-    except FileNotFoundError:
-        return empty_output(rel_file)
-    size = len(data)
-    try:
-        content = data.decode("utf-8")
-        return CmdOutput(file=rel_file, bytes=size, content_encoding="utf-8", content=content)
-    except UnicodeDecodeError:
-        return CmdOutput(file=rel_file, bytes=size, content_encoding="base64", content=base64.b64encode(data).decode("ascii"))
 
 
 def empty_output(file: str) -> CmdOutput:

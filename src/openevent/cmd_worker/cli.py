@@ -5,8 +5,6 @@ import logging
 import signal
 import sys
 
-from openevent.cmd_sdk.dependencies import require_sdk
-
 from .config import ConfigError, load_config
 from .worker import CmdWorker
 
@@ -26,9 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
-        require_sdk()
         config = load_config(args.config)
-    except (ConfigError, RuntimeError) as exc:
+    except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     from openevent.sdk import OpenEventClient

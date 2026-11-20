@@ -1,10 +1,10 @@
-# Cmd 协议 cmd.v3
+# Cmd 协议 cmd.v4
 
 [English version](CMD_PROTOCOL.md)
 
 ## 1. 通道
 
-cmd 通道必须设置 `protocol="cmd.v3"`，不能使用 public visibility。调用方和 worker principal
+cmd 通道必须设置 `protocol="cmd.v4"`，不能使用 public visibility。调用方和 worker principal
 都必须是通道成员，同一通道同一时刻只能有一个有效 worker 消费。
 
 `description` 是可选的普通说明文字，可以为空；worker 不解析其内容。
@@ -26,7 +26,7 @@ cmd 通道必须设置 `protocol="cmd.v3"`，不能使用 public visibility。�
 发送方 principal；payload 中的 `prev_seq` 必填，等于对应请求的 OpenEvent `seq`。
 
 输出的 `content_encoding` 为 `utf-8` 或 `base64`：原始字节能按 UTF-8 解码时，`content` 写解码后的
-字符串；否则写原始字节的 base64 字符串。两字段必须同时出现。空输出使用 `bytes=0`、
+字符串；否则写原始字节的 base64 字符串。两字段必须同时出现。空内容使用
 `content_encoding="utf-8"`、`content=""`。
 
 非系统消息的 payload 无法解码为 UTF-8 JSON 对象，或消息类型、字段校验失败时，worker 报错退出，
@@ -56,11 +56,11 @@ cmd 通道必须设置 `protocol="cmd.v3"`，不能使用 public visibility。�
 - 消息的 OpenEvent `seq` 是命令任务 ID。
 - `command` 必填，是包含完整 Linux 命令行的非空字符串。worker 默认通过 `/bin/sh -c <command>` 执行；
   进程管理范围见[任务进程生命周期](CONFIGURATION_cn.md#任务进程生命周期)。不支持独立的 `env` 或 `stdin` 字段。
+  命令默认从 `/dev/null` 读取标准输入，读取时立即遇到 EOF。可以在命令中用 shell 重定向或管道提供输入。
 - `workdir` 可选，必须是非空的绝对路径字符串；缺失时使用 worker 当前工作目录。
   路径不存在、不是目录、无权进入或导致 shell 无法启动时，写 `START_FAILED` 和 `error_message`，不视为非法 payload。
 - `timeout_ms` 可选，必须是 `1..18446744073709551615`（`2**64-1`）范围内的整数。
-  缺失时使用处理请求时的当前默认值；[启动恢复](CONFIGURATION_cn.md#恢复与退出)也使用当前配置，
-  包括补写 `RECOVERY_FAILED`。
+  省略时使用 worker 处理请求时的 `default_timeout_ms`。启动时如何处理历史请求，见[恢复与退出](CONFIGURATION_cn.md#恢复与退出)。
 - 超时截止时间为本条消息的顶层 `EventMessage.ts_ms` 加有效 `timeout_ms`，不能用 payload 的 `ts_ms`。
 
 调用方可以在本条消息的 OpenEvent 顶层 `object_keys` 中附带命令需要的对象读取凭据；它不是 payload 字段。
@@ -82,8 +82,8 @@ worker 把这些凭据交给本次命令的运行环境，命令不需要向调�
 
 ## 4. `cmd.run.accepted`
 
-worker 接手合法且未超时的运行请求时，必须先确认写入 accepted，再启动命令。此后写最终
-`cmd.run.result`；未完成的请求在启动恢复时补失败 result。
+worker 接手合法且未超时的运行请求时，必须先确认写入 `cmd.run.accepted`，再启动命令，随后写入最终的 `cmd.run.result`。
+启动恢复时，只有已写入 `cmd.run.accepted` 且尚无 `cmd.run.result` 的运行请求才补写 `RECOVERY_FAILED`。详见[恢复规则](CONFIGURATION_cn.md#恢复与退出)。
 
 ```json
 {
@@ -95,7 +95,8 @@ worker 接手合法且未超时的运行请求时，必须先确认写入 accept
 
 - accepted 确认后再次检查超时；若发布期间截止时间已到，不启动进程，写 `TIMEOUT`。
   因此 accepted 不保证命令已经启动。
-- 获得执行槽位前超时或在队列中被 kill 时，不写 accepted，分别直接写 `TIMEOUT`、`KILLED` 运行结果。
+- 排队任务达到截止时间即可写 `TIMEOUT`，即使执行槽位全部占满。排队时被 kill 的处理顺序见第 7 节。
+  两种情况均不写 accepted。
 
 ## 5. `cmd.run.result`
 
@@ -114,10 +115,10 @@ worker 接手合法且未超时的运行请求时，必须先确认写入 accept
 ```
 
 - `timeout_ms` 必填，是按第 3 节确定的有效超时。
-  `RECOVERY_FAILED` 使用请求显式值或恢复时的当前默认值。
 - 公共字段 `ts_ms` 表示本条结果的生成时间，不表示命令实际结束时间。
   `started_at_ms` 表示进程实际启动时间，只在进程实际启动后出现。
 - `exit_code` 是 shell 退出码，只在 `SUCCESS` 或 `FAILED` 时出现。
+  若 shell 本身因信号 `N` 终止且结果为 `FAILED`，则 `exit_code` 为 `-N`。例如，SIGTERM 对应 `-15`。
 - `START_FAILED`、`RECOVERY_FAILED` 必须写 `error_message`。
 - 启动前超时、队列中被 kill 或启动失败时，stdout/stderr 写空输出对象。
   `RECOVERY_FAILED` 按已有输出文件生成输出对象，文件不存在时写空输出对象。
@@ -196,7 +197,8 @@ stdout 和 stderr 独立使用相同规则：
 | `NOT_RUNNING` | 当前通道没有可终止的运行中或待执行目标，不区分已完成和从未存在 |
 
 kill 先触发终止时，运行结果为 `KILLED`；超时已先触发时保留 `TIMEOUT`。
-删除待执行任务时，先确认写入运行结果 `KILLED`，再写 `REMOVED_PENDING`。
+处理 kill 时，若目标仍在排队且已达到截止时间，先确认写入运行结果 `TIMEOUT`，再回复 `NOT_RUNNING`。
+尚未到期则先确认写入运行结果 `KILLED`，再回复 `REMOVED_PENDING`。
 两条结果之间崩溃时，重启后运行请求保持已闭合，未完成的 kill 请求返回 `NOT_RUNNING`。
 
 shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATION_cn.md#任务进程生命周期)完成清理和回收，
@@ -239,7 +241,6 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
   "stream": "stdout",
   "offset": 0,
   "nbytes": 6,
-  "bytes": 6,
   "eof": true,
   "content_encoding": "utf-8",
   "content": "hello\n"
@@ -247,8 +248,7 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 ```
 
 - `target_seq`、`stream`、`offset`、`nbytes` 必填，必须回显原请求中的值。
-- `status`、`content`、`content_encoding` 必填；成功时 `bytes` 必须等于请求的 `nbytes`，
-  `content` 解码后必须是请求范围内的完整原始字节。
+- `status`、`content`、`content_encoding` 必填。成功时，`content` 解码后必须是请求范围内完整的 `nbytes` 个原始字节。
 - worker 打开文件后先取得当时的大小；成功时 `eof` 为 `offset + nbytes == 初始文件大小`。
   `eof=true` 不保证运行中的任务以后不会追加输出。
 
@@ -260,9 +260,10 @@ shell 已退出但尚未收尾时，先按[任务进程生命周期](CONFIGURATI
 | `NOT_FOUND` | 目标输出文件不存在 | `true` | — |
 | `READ_FAILED` | 文件存在但无法 stat、打开或读取，或无法满足第 8 节的精确范围及消息大小要求 | `false` | 必填 |
 
-后两种状态均写 `content=""`、`bytes=0`、`content_encoding="utf-8"`。
+后两种状态均写 `content=""`、`content_encoding="utf-8"`。
 
 ## 10. 版本策略
 
-本包实现 `cmd.v3`，通道和调用方须使用该协议。
-破坏性变更必须使用新协议，例如 `cmd.v4`。
+本包实现 `cmd.v4`，通道和调用方须使用该协议。
+从旧版本升级时，创建 `cmd.v4` 通道，让调用方发到新通道，并更新 worker 的 `channel_ids` 配置。
+破坏性变更必须使用新的协议版本。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
@@ -66,5 +67,6 @@ def parse_message(message) -> ParsedMessage:
         seq=int(message.seq), channel_id=int(message.channel_id),
         principal=int(message.principal),
         recipients=tuple(int(value) for value in message.recipients), payload=payload,
-        object_keys=tuple(message.object_keys),
+        # Retained protobuf submessages would keep the whole Fetch page alive.
+        object_keys=tuple(deepcopy(key) for key in message.object_keys),
     )

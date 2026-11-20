@@ -4,34 +4,37 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
 OUT_DIR="$ROOT_DIR/dist"
-TOOLS_ENV_DIR="$BUILD_DIR/tools-env"
-PYCACHE_DIR="$BUILD_DIR/pycache"
-TMP_WORK_DIR="$BUILD_DIR/tmp"
 PYTHON_BIN="${PYTHON:-python3}"
 
-rm -rf \
-  "$PYCACHE_DIR" \
-  "$TMP_WORK_DIR" \
-  "$BUILD_DIR/build-src" \
-  "$BUILD_DIR/test-src" \
-  "$BUILD_DIR/deps" \
-  "$BUILD_DIR/cache" \
-  "$BUILD_DIR/venv"
-rm -f "$OUT_DIR"/*.whl "$OUT_DIR"/*.tar.gz
-mkdir -p "$OUT_DIR" "$PYCACHE_DIR" "$TMP_WORK_DIR"
-
-export PYTHONPYCACHEPREFIX="$PYCACHE_DIR"
-export PYTHONDONTWRITEBYTECODE=1
-export PIP_NO_CACHE_DIR=1
-export PIP_NO_COMPILE=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
-export TMPDIR="$TMP_WORK_DIR"
-unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX PIP_ROOT PIP_USER
+export PIP_CACHE_DIR="$BUILD_DIR/pip-cache"
+export TMPDIR="$BUILD_DIR/tmp"
 
 cd "$ROOT_DIR"
+mode=${1:-build}
+if [[ "$mode" == --install || "$mode" == --test ]]; then
+  "$PYTHON_BIN" -B scripts/install.py --check-environment
+fi
 
-"$PYTHON_BIN" -B scripts/prepare_build_env.py
+mkdir -p "$OUT_DIR" "$TMPDIR"
+rm -f "$OUT_DIR"/openevent_modules_cmd-*.whl
+wheel_dir=$(mktemp -d "$TMPDIR/cmd-wheel.XXXXXXXX")
+trap 'rm -rf "$wheel_dir"' EXIT
 
-"$TOOLS_ENV_DIR/bin/python" -B -m build --no-isolation --skip-dependency-check --wheel --outdir "$OUT_DIR"
+env -u PIP_TARGET -u PIP_PREFIX -u PIP_ROOT -u PIP_USER \
+  "$PYTHON_BIN" -B -m pip wheel --no-deps --wheel-dir "$wheel_dir" .
 
-printf 'build artifacts: %s\n' "$OUT_DIR"
+shopt -s nullglob
+wheels=("$wheel_dir"/openevent_modules_cmd-*.whl)
+if (( ${#wheels[@]} != 1 )); then
+  printf 'Expected one Cmd wheel from this build, found %s.\n' "${#wheels[@]}" >&2
+  exit 1
+fi
+wheel=${wheels[0]}
+release="$OUT_DIR/$(basename "$wheel")"
+mv -- "$wheel" "$release"
+printf 'Built %s\n' "$release"
+case "$mode" in
+  --install) "$PYTHON_BIN" -B scripts/install.py "$release" ;;
+  --test) "$PYTHON_BIN" -B scripts/install.py --test-env "$release" ;;
+esac
